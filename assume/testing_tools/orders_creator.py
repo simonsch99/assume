@@ -131,15 +131,6 @@ def write_block_orders(path: Path) -> None:
     rows.append(_block_row("B_DE_FLEX_E", "C04", "GRP_DE_FLEX", 66.0,
                            profile(range(17, 22), -600), "DE"))
 
-    # --- Speicher als Referenz (negative + positive Stunden) -------------
-    # Laden nachts (negativ = Kauf), Entladen abends (positiv = Verkauf).
-    # Preis ist der Nettopreis des gesamten Blockprofils.
-    storage = [0.0] * 24
-    for h in (2, 3, 4):
-        storage[h] = 400.0
-    for h in (18, 19):
-        storage[h] = -550.0
-    rows.append(_block_row("B_DE_STOR1", "C01", "", 40.0, storage, "DE"))
 
     with open(path, "w", newline="") as f:
         csv.writer(f, delimiter=";").writerows(rows)

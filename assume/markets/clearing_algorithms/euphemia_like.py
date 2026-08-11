@@ -405,7 +405,7 @@ def market_clearing_opt_constraints(
 
                 for line in model.lines:
                     ramp_limit = line_ramping.get(line)
-                    if ramp_limit is None or ramp_limit <= 0:
+                    if ramp_limit is None or pd.isna(ramp_limit) or ramp_limit <= 0:
                         continue
                     # Calculate time delta in hours TODO check if this is needed
                     time_delta = (t_next - t_current) / timedelta(hours=1)
@@ -639,15 +639,22 @@ class ComplexClearingRole(MarketRole):
 
             # Extrace losses per line (as percentage)
             if "losses" in self.lines.columns:
-                self.line_losses = self.lines["losses"].to_dict()
-
+                self.line_losses = {
+                    line_id: (0.0 if pd.isna(val) else float(val))
+                    for line_id, val in self.lines["losses"].items()
+                }
             # Extract tariffs per line (€/MWh)
             if "tariff" in self.lines.columns:
-                self.line_tariffs = self.lines["tariff"].to_dict()
-
+                self.line_tariffs = {
+                    line_id: (0.0 if pd.isna(val) else float(val))
+                    for line_id, val in self.lines["tariff"].items()
+                }
             # Extract ramoping limits per line (MW/h)
             if "ramping_limit" in self.lines.columns:
-                self.line_ramping = self.lines["ramping_limit"].to_dict()
+                self.line_ramping = {
+                    line_id: (None if pd.isna(val) else float(val))
+                    for line_id, val in self.lines["ramping_limit"].items()
+                }
             else:
                 self.line_ramping = {line_id: None for line_id in self.lines.index}
 

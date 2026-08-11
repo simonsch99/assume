@@ -15,19 +15,19 @@ tool = ClearingTestTool(
 
 # 1) Netz zonal laden
 tool.load_grid(
-    buses_csv="test_data/buses.csv",
-    lines_csv="test_data/lines.csv",
+    buses_csv="assume/testing_tools/test_data/buses.csv",
+    lines_csv="assume/testing_tools/test_data/lines.csv",
     zones_identifier="zone_id",
 )
 
 # 2) Gebote laden
 tool.load_orders(
     delivery_date=datetime(2026, 8, 12, 0, 0),
-    hourly_csv="test_data/test_hourly_2zone.csv",
-    block_csv="test_data/test_blocks_2zone.csv",
+    hourly_csv="assume/testing_tools/test_data/test_hourly_2zone.csv",
+    block_csv="assume/testing_tools/test_data/test_blocks_2zone.csv",
 )
 
 # 3) Clearing
 tool.run_clearing()
 tool.print_summary()
-tool.export_results("results/2zone_base")
+tool.export_results("assume/testing_tools/results/2zone_base")

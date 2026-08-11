@@ -98,14 +98,14 @@ class BlockOrderReader:
         return blocks
 
     def _read_line(self, row: list[str]) -> dict:
-        quantities = [float(row[6 + i]) for i in range(24)]
+        quantities = [-1 * float(row[6 + i]) for i in range(24)]
         return {
             "raw_id": row[1].strip(),
             "type": row[2].strip(),
             "special_id": row[3].strip() or None,
             "price": float(row[5]),
-            "hours": -quantities, # EPEX SPOT data has demand as positive and supply as negative volumes, ASSUME works the other way around
-            "acc_ratio": float(row[30]),
+            "hours": quantities, # EPEX SPOT data has demand as positive and supply as negative volumes, ASSUME works the other way around
+            "acc_ratio": float(row[30]) if row[30].strip() else None,
             "bidding_zone": row[32].strip() if len(row) > 32 else "node0",
         }
 
@@ -169,7 +169,6 @@ class ClearingTestTool:
         delivery_date: datetime,
         hourly_csv: Optional[str] = None,
         block_csv: Optional[str] = None,
-        block_acc_ratio_col: Optional[int] = None,
         default_node: str = "node0",
     ) -> Orderbook:
         """
@@ -195,7 +194,7 @@ class ClearingTestTool:
             orderbook += self._hourly_to_orderbook(hourly, default_node)
 
         if block_csv:
-            blocks = BlockOrderReader().read(block_csv, block_acc_ratio_col)
+            blocks = BlockOrderReader().read(block_csv)
             orderbook += self._blocks_to_orderbook(blocks, default_node)
 
         # sanity check: parent bids of linked bids must exist
