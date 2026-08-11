@@ -1,0 +1,4 @@
+name,bus0,bus1,s_nom,s_max_pu,capacity_method,losses,tariff,ramping_limit
+line_DE_int,bus_DE_north,bus_DE_south,5000.0,1.0,ATC,0.0,0.0,
+line_FR_int,bus_FR_north,bus_FR_south,5000.0,1.0,ATC,0.0,0.0,
+line_DE_FR,bus_DE_south,bus_FR_north,2000.0,1.0,ATC,0.0,0.0,

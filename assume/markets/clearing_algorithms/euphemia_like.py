@@ -1,4 +1,4 @@
-### This clearing algorithm is an extended version of the comnplex_clearing.py with more extensive grid simulation.
+### This clearing algorithm is an extended version of the comnplex_clearing.py with more extensive grid simulation and exclusive group orders.
 
 
 # SPDX-FileCopyrightText: ASSUME Developers
@@ -197,8 +197,6 @@ def _add_line_tariffs_to_objective(
             obj_expr += tariff * pyo.abs(flow)
     
     return obj_expr
-
-
 
     
 def market_clearing_opt_constraints(

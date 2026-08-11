@@ -1,0 +1,5 @@
+name,zone_id,v_nom,x,y
+bus_DE_north,DE,380.0,10.0,53.5
+bus_DE_south,DE,380.0,11.5,48.1
+bus_FR_north,FR,400.0,2.3,48.9
+bus_FR_south,FR,400.0,5.4,43.3
