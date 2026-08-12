@@ -109,58 +109,38 @@ def _get_line_capacity(line_id: str, lines: pd.DataFrame, line_methods: dict, ti
         )
         return lines.at[line_id, "s_nom"] * s_max_pu
 
-def _add_line_losses_to_balance(
-    balance_expr,
-    model: pyo.ConcreteModel,
-    incidence_matrix: pd.DataFrame,
-    line_losses: dict,
-    node: str,
-    t,
-):
+def _line_balance_terms(model, incidence_matrix, line_losses, node, t):
     """
-    Adds loss terms to the energy balance for a given node and timestep.
-    
-    Losses are modeled as: loss = loss_factor * |flow|
-    For positive flows (A→B): loss occurs at destination node B
-    For negative flows (B→A): loss occurs at destination node A
-    
-    Args:
-        balance_expr: The current balance expression
-        model: The Pyomo model
-        incidence_matrix: The incidence matrix
-        line_losses: Dict mapping line_id to loss factor (0.02 = 2%)
-        node: The node for which to calculate losses
-        t: The timestep
-    
-    Returns:
-        Updated balance expression with loss terms
+    Network contribution to the energy balance of `node` at time `t`,
+    following Chatzigiannis et al. (2016), Eq. (13) / (15).
+
+    Sign convention (ASSUME): incidence[node, line] == -1 -> line starts at node
+    (theta), == +1 -> line ends at node (phi). Volumes are positive for supply,
+    so an export must appear with a positive sign in the balance expression
+    (balance == 0).
     """
-    if line_losses is None or not any(line_losses.values()):
-        return balance_expr
-    
+    expr = 0.0
     for line in model.lines:
-        loss_factor = line_losses.get(line, 0.0)
-        if loss_factor == 0.0:
+        inc = incidence_matrix.loc[node, line]
+        if inc == 0:
             continue
-        
-        incidence_value = incidence_matrix.loc[node, line]
-        if incidence_value == 0:
+
+        gamma = (line_losses or {}).get(line, 0.0)
+
+        if line not in model.split_lines:
+            expr += inc * model.flows[t, line]
             continue
-        
-        # Loss is proportional to |flow|, which requires absolute value
-        # In linear form: loss = loss_factor * flow (for positive flow direction)
-        # For bidirectional: we use piecewise linear or accept the approximation
-        # Here we use: loss_outflow = loss_factor * max(0, flow)
-        # This is implemented via additional variables if needed, or simplified
-        
-        flow = model.flows[t, line]
-        
-        # Simplified: assume losses on outflow (positive flow direction)
-        # This is a linear approximation; full nonlinear would require abs()
-        if incidence_value > 0:  # Outflow from this node
-            balance_expr += loss_factor * flow
-    
-    return balance_expr
+
+        f_pos = model.flow_pos[t, line]
+        f_neg = model.flow_neg[t, line]
+
+        if inc < 0:
+            # node is the origin (theta == 1): full export, lossy import
+            expr += -(f_pos - (1.0 - gamma) * f_neg)
+        else:
+            # node is the destination (phi == 1): lossy import, full export
+            expr += (1.0 - gamma) * f_pos - f_neg
+    return expr
 
 
 def _add_line_tariffs_to_objective(
@@ -183,19 +163,14 @@ def _add_line_tariffs_to_objective(
     Returns:
         Updated objective expression with tariff costs
     """
-    if line_tariffs is None or not any(line_tariffs.values()):
+    if not line_tariffs or not any(line_tariffs.values()):
         return obj_expr
-    
     for t in model.T:
-        for line in model.lines:
+        for line in model.split_lines:
             tariff = line_tariffs.get(line, 0.0)
             if tariff == 0.0:
                 continue
-            
-            flow = model.flows[t, line]
-            # Tariff on absolute flow
-            obj_expr += tariff * pyo.abs(flow)
-    
+            obj_expr += tariff * (model.flow_pos[t, line] + model.flow_neg[t, line])
     return obj_expr
 
     
@@ -270,6 +245,29 @@ def market_clearing_opt_constraints(
     if incidence_matrix is not None:
         # Decision variables for flows on each line at each timestep
         model.flows = pyo.Var(model.T, model.lines, domain=pyo.Reals, doc="power_flows")
+
+        # lines with losses or tariffs need the positive/negative decomposition
+        lossy_lines = [
+            line for line in line_ids
+            if (line_losses or {}).get(line, 0.0) > 0.0
+            or (line_tariffs or {}).get(line, 0.0) > 0.0
+        ]
+        model.split_lines = pyo.Set(initialize=lossy_lines, doc="lines_with_flow_split")
+
+        model.flow_pos = pyo.Var(
+            model.T, model.split_lines, domain=pyo.NonNegativeReals, doc="flow_forward"
+        )
+        model.flow_neg = pyo.Var(
+            model.T, model.split_lines, domain=pyo.NonNegativeReals, doc="flow_backward"
+        )
+
+        model.flow_split_constr = pyo.ConstraintList()
+        for t in model.T:
+            for line in model.split_lines:
+                model.flow_split_constr.add(
+                    model.flows[t, line]
+                    == model.flow_pos[t, line] - model.flow_neg[t, line]
+                )
 
     if mode == "with_min_acceptance_ratio":
         model.Bids = pyo.Set(
@@ -367,15 +365,8 @@ def market_clearing_opt_constraints(
 
         # Add contributions from line flows based on the incidence matrix
         if incidence_matrix is not None:
-            for line in model.lines:
-                incidence_value = incidence_matrix.loc[node, line]
-                if incidence_value != 0:
-                    balance_expr += incidence_value * model.flows[t, line]
-
-        # Add loss terms if losses are defined
-        if line_losses is not None and any(line_losses.values()):
-            balance_expr = _add_line_losses_to_balance(
-                balance_expr, model, incidence_matrix, line_losses, node, t
+            balance_expr += _line_balance_terms(
+                model, incidence_matrix, line_losses, node, t
             )
 
         return balance_expr == 0
