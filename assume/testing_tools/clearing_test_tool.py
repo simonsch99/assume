@@ -159,6 +159,7 @@ class ClearingTestTool:
             "rejected_orders": [],
             "market_meta": [],
             "flows": {},
+            "line_results": [],
         }
 
     # ------------------------------------------------------------------ #
@@ -428,6 +429,7 @@ class ClearingTestTool:
             "rejected_orders": rejected,
             "market_meta": meta,
             "flows": flows or {},
+            "line_results": getattr(self.clearing_algorithm, "line_results", []),
         }
         logger.info(
             "Clearing done: %s accepted, %s rejected", len(accepted), len(rejected)
@@ -451,13 +453,17 @@ class ClearingTestTool:
             out / "market_meta.csv", index=False
         )
 
-        if include_flows and self.results["flows"]:
-            pd.DataFrame(
-                [
-                    {"time": k[0], "line": k[1], "flow": v}
-                    for k, v in self.results["flows"].items()
-                ]
-            ).to_csv(out / "flows.csv", index=False)
+        if include_flows:
+            line_results = self.results.get("line_results") or []
+            if line_results:
+                pd.DataFrame(line_results).to_csv(out / "flows.csv", index=False)
+            elif self.results["flows"]:
+                pd.DataFrame(
+                    [
+                        {"time": k[0], "line": k[1], "flow": v}
+                        for k, v in self.results["flows"].items()
+                    ]
+                ).to_csv(out / "flows.csv", index=False)
 
         logger.info("Results exported to %s", out)
 

@@ -1,142 +1,221 @@
-"""Erzeugt Testgebote im EPEX-artigen Format für ein 2-Zonen-System (24 h)."""
-
 import csv
 from pathlib import Path
 
-OUT = Path("assume/testing_tools/test_data")
-OUT.mkdir(exist_ok=True)
 
-# --- Nachfrageprofile (MW) -------------------------------------------------
-DEMAND = {
-    "DE": [6800, 6400, 6200, 6100, 6300, 7000, 8200, 9200, 9800, 9900, 9800, 9700,
-           9500, 9400, 9300, 9400, 9800, 10500, 11000, 10800, 10000, 9000, 8000, 7200],
-    "FR": [3600, 3400, 3300, 3250, 3350, 3700, 4300, 4800, 5100, 5150, 5100, 5050,
-           4950, 4900, 4850, 4900, 5100, 5450, 5500, 5400, 5100, 4700, 4200, 3800],
-}
-
-# --- Erzeugungsstufen: (Label, Preis €/MWh, Kapazität MW) -------------------
-SUPPLY_STEPS = {
-    "DE": [
-        ("de_lignite", 22.0, 2500),
-        ("de_coal",    38.0, 2500),
-        ("de_gas_cc",  62.0, 3000),
-        ("de_gas_ot",  95.0, 2000),
-        ("de_oil",    180.0, 1500),
-    ],
-    "FR": [
-        ("fr_hydro",   15.0, 1200),
-        ("fr_gas_cc",  58.0, 2000),
-        ("fr_gas_ot",  88.0, 1500),
-        ("fr_oil",    160.0, 1200),
-    ],
-}
-
-# --- Preisunelastischer Nachfrageanteil ------------------------------------
-INELASTIC_PRICE = 3000.0      # muss <= maximum_bid_price sein
-ELASTIC_SHARE = 0.10          # 10 % der Last als Preisstufen
-ELASTIC_PRICES = [200.0, 120.0, 70.0]
+OUTPUT_DIR = Path("assume/testing_tools/test_data")
+HOURLY_FILE = OUTPUT_DIR / "test_hourly_block_features_2zone.csv"
+BLOCK_FILE = OUTPUT_DIR / "test_blocks_features_2zone.csv"
 
 
-def write_hourly_orders(path: Path) -> None:
-    """Schreibt Stundengebote: 8 Spalten, komma-separiert.
+def create_hourly_orders(path: Path) -> None:
+    """
+    Creates four simple hourly orders for every delivery hour:
 
-    Spaltenbelegung gemäss hourly_orders_reader:
-    0=id, 1=frei, 2=frei, 3=hour(1-basiert), 4=price, 5=quantity,
-    6='Purchase'|'Sell', 7=bidding_zone
+    DE:
+      - 100 MW demand at 1000 EUR/MWh
+      - 200 MW backstop supply at 100 EUR/MWh
+
+    FR:
+      - 100 MW demand at 1000 EUR/MWh
+      - 40 MW base supply at 20 EUR/MWh
+
+    Before block orders, the system therefore clears:
+      - 200 MW demand
+      - 40 MW cheap supply
+      - 160 MW backstop supply
+
+    The DE-FR line remains uncongested.
     """
     rows = []
-    oid = 0
 
-    for zone in ("DE", "FR"):
-        for h in range(24):
-            load = DEMAND[zone][h]
-            inelastic = load * (1.0 - ELASTIC_SHARE)
-            elastic_block = load * ELASTIC_SHARE / len(ELASTIC_PRICES)
+    for hour in range(1, 25):
+        rows.extend(
+            [
+                [f"D_DE_{hour:02d}","HOURLY","",hour,1000.0,100.0,"Purchase","DE",],
+                [f"D_FR_{hour:02d}","HOURLY","",hour,1000.0,100.0,"Purchase","FR",],
+                [f"S_FR_BASE_{hour:02d}","HOURLY","fr_base",hour,20.0,40.0,"Sell","FR",],
+                [f"S_DE_BACKSTOP_{hour:02d}","HOURLY","de_backstop",hour,100.0,200.0,"Sell","DE",],
+            ]
+        )
 
-            # Preisunelastische Grundlast
-            oid += 1
-            rows.append([f"D{oid:05d}", "HOURLY", "", h + 1,
-                         INELASTIC_PRICE, round(inelastic, 1),
-                         "Purchase", zone])
-
-            # Elastische Nachfragestufen
-            for p in ELASTIC_PRICES:
-                oid += 1
-                rows.append([f"D{oid:05d}", "HOURLY", "", h + 1,
-                             p, round(elastic_block, 1),
-                             "Purchase", zone])
-
-            # Angebotsstufen
-            for label, price, cap in SUPPLY_STEPS[zone]:
-                oid += 1
-                rows.append([f"S{oid:05d}", "HOURLY", label, h + 1,
-                             price, float(cap),
-                             "Sell", zone])
-
-    with open(path, "w", newline="") as f:
-        csv.writer(f).writerows(rows)
-    print(f"{path}: {len(rows)} Zeilen")
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerows(rows)
 
 
-def _block_row(bid_id, btype, special_id, price, quantities, zone):
-    """Baut eine Blockzeile mit 33 Spalten gemäss block_orders_reader.
-
-    0='BB', 1=id, 2=type(C01/C02/C04), 3=special_id, 4=frei,
-    5=price, 6..29=24 Stundenmengen, 30..31=frei, 32=bidding_zone
+def block_row(
+    bid_id: str,
+    block_type: str,
+    price: float,
+    zone: str,
+    quantities: dict[int, float],
+    minimum_acceptance_ratio: float = 1.0,
+    special_id: str = "",
+) -> list:
     """
-    row = ["BB", bid_id, btype, special_id, "", price]
-    row += [float(q) for q in quantities]      # Spalten 6-29
-    row += ["", ""]                            # Spalten 30-31
-    row.append(zone)                           # Spalte 32
-    assert len(row) == 33, len(row)
+    Builds one 33-column block-order row.
+
+    quantities uses delivery hours 1..24.
+
+    Important:
+      The block CSV reader multiplies quantities by -1.
+      Therefore, negative CSV quantities represent supply orders.
+    """
+    hourly_quantities = [
+        quantities.get(hour, 0.0)
+        for hour in range(1, 25)
+    ]
+
+    row = [
+        "BB",                         # 0: marker
+        bid_id,                       # 1: block ID
+        block_type,                   # 2: C01, C02, or C04
+        special_id,                   # 3: parent or exclusive-group ID
+        "",                           # 4: unused
+        price,                        # 5: price
+        *hourly_quantities,           # 6..29: 24 hourly quantities
+        minimum_acceptance_ratio,     # 30: minimum acceptance ratio
+        "",                           # 31: unused
+        zone,                         # 32: bidding zone
+    ]
+
+    assert len(row) == 33
     return row
 
 
-def write_block_orders(path: Path) -> None:
-    """Schreibt Blockgebote."""
-    rows = []
+def create_block_orders(path: Path) -> None:
+    rows = [
+        # ---------------------------------------------------------------
+        # Hours 1-4: ordinary fill-or-kill blocks
+        # ---------------------------------------------------------------
+        block_row(
+            bid_id="REG_GOOD",
+            block_type="C01",
+            price=50.0,
+            zone="DE",
+            quantities={hour: -40.0 for hour in range(1, 5)},
+            minimum_acceptance_ratio=1.0,
+        ),
+        block_row(
+            bid_id="REG_BAD",
+            block_type="C01",
+            price=150.0,
+            zone="FR",
+            quantities={hour: -40.0 for hour in range(1, 5)},
+            minimum_acceptance_ratio=1.0,
+        ),
 
-    def profile(hours, value):
-        """24er-Vektor, nur in 'hours' mit 'value' besetzt."""
-        q = [0.0] * 24
-        for h in hours:
-            q[h] = float(value)
-        return q
+        # ---------------------------------------------------------------
+        # Hours 5-6: profiled, partially accepted block
+        #
+        # At hour 6, only 160 MW remains after the 40 MW base supply.
+        # The 200 MW profile therefore limits acceptance to:
+        #
+        #     160 / 200 = 0.8
+        #
+        # At hour 5 this produces 0.8 * 160 = 128 MW.
+        # ---------------------------------------------------------------
+        block_row(
+            bid_id="PROFILE_PARTIAL",
+            block_type="C01",
+            price=60.0,
+            zone="FR",
+            quantities={
+                5: -160.0,
+                6: -200.0,
+            },
+            minimum_acceptance_ratio=0.5,
+        ),
 
-    # --- Einfache Blöcke (C01): Grundlast-Kernkraft -----------------------
-    # Positive Mengen = Verkauf, muss-laufend über 24 h.
-    rows.append(_block_row("B_DE_NUC1", "C01", "", 18.0,
-                           profile(range(24), -1600), "DE"))
-    rows.append(_block_row("B_DE_NUC2", "C01", "", 20.0,
-                           profile(range(24), -1200), "DE"))
-    rows.append(_block_row("B_FR_NUC1", "C01", "", 12.0,
-                           profile(range(24), -2600), "FR"))
-    rows.append(_block_row("B_FR_NUC2", "C01", "", 14.0,
-                           profile(range(24), -1800), "FR"))
+        # ---------------------------------------------------------------
+        # Hours 7-10: profitable child saves a loss-making parent
+        #
+        # Parent: 20 MW at 120 EUR/MWh
+        # Child:  60 MW at  20 EUR/MWh
+        #
+        # Their combined weighted price is:
+        # (20*120 + 60*20) / 80 = 45 EUR/MWh.
+        # ---------------------------------------------------------------
+        block_row(
+            bid_id="LINK_PARENT_SAVED",
+            block_type="C01",
+            price=120.0,
+            zone="FR",
+            quantities={hour: -20.0 for hour in range(7, 11)},
+            minimum_acceptance_ratio=1.0,
+        ),
+        block_row(
+            bid_id="LINK_CHILD_GOOD",
+            block_type="C02",
+            special_id="LINK_PARENT_SAVED",
+            price=20.0,
+            zone="FR",
+            quantities={hour: -60.0 for hour in range(7, 11)},
+            minimum_acceptance_ratio=1.0,
+        ),
 
-    # --- Verknüpfte Blöcke (C02): Kohleblock + Aufschlagstufe ------------
-    # Parent muss vor dem Child gelesen werden; Reihenfolge ist hier egal,
-    # load_orders prüft die Existenz nachträglich.
-    rows.append(_block_row("B_DE_COAL_P", "C01", "", 34.0,
-                           profile(range(6, 22), -900), "DE"))
-    rows.append(_block_row("B_DE_COAL_C", "C02", "B_DE_COAL_P", 45.0,
-                           profile(range(8, 20), -400), "DE"))
+        # ---------------------------------------------------------------
+        # Hours 11-12: parent accepted, unprofitable child rejected
+        # ---------------------------------------------------------------
+        block_row(
+            bid_id="LINK_PARENT_GOOD",
+            block_type="C01",
+            price=30.0,
+            zone="DE",
+            quantities={hour: -40.0 for hour in range(11, 13)},
+            minimum_acceptance_ratio=1.0,
+        ),
+        block_row(
+            bid_id="LINK_CHILD_BAD",
+            block_type="C02",
+            special_id="LINK_PARENT_GOOD",
+            price=150.0,
+            zone="DE",
+            quantities={hour: -40.0 for hour in range(11, 13)},
+            minimum_acceptance_ratio=1.0,
+        ),
 
-    # --- Exklusive Gruppe (C04): flexibler Gasblock, 3 Zeitfenster -------
-    # Genau eine der drei Varianten darf akzeptiert werden.
-    rows.append(_block_row("B_DE_FLEX_M", "C04", "GRP_DE_FLEX", 70.0,
-                           profile(range(7, 12), -600), "DE"))
-    rows.append(_block_row("B_DE_FLEX_A", "C04", "GRP_DE_FLEX", 68.0,
-                           profile(range(12, 17), -600), "DE"))
-    rows.append(_block_row("B_DE_FLEX_E", "C04", "GRP_DE_FLEX", 66.0,
-                           profile(range(17, 22), -600), "DE"))
+        # ---------------------------------------------------------------
+        # Hours 13-16: mutually exclusive blocks
+        #
+        # Both are cheaper than the 100 EUR/MWh backstop supply.
+        # Without the exclusive constraint, both would be economical.
+        # With the constraint, only the cheaper block should clear.
+        # ---------------------------------------------------------------
+        block_row(
+            bid_id="EXCLUSIVE_A",
+            block_type="C04",
+            special_id="EX_GROUP_1",
+            price=30.0,
+            zone="DE",
+            quantities={hour: -60.0 for hour in range(13, 17)},
+            minimum_acceptance_ratio=1.0,
+        ),
+        block_row(
+            bid_id="EXCLUSIVE_B",
+            block_type="C04",
+            special_id="EX_GROUP_1",
+            price=70.0,
+            zone="FR",
+            quantities={hour: -60.0 for hour in range(13, 17)},
+            minimum_acceptance_ratio=1.0,
+        ),
+    ]
+
+    with path.open("w", newline="") as file:
+        writer = csv.writer(file, delimiter=";")
+        writer.writerows(rows)
 
 
-    with open(path, "w", newline="") as f:
-        csv.writer(f, delimiter=";").writerows(rows)
-    print(f"{path}: {len(rows)} Zeilen")
+def main() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    create_hourly_orders(HOURLY_FILE)
+    create_block_orders(BLOCK_FILE)
+
+    print(f"Created {HOURLY_FILE}")
+    print(f"Created {BLOCK_FILE}")
 
 
 if __name__ == "__main__":
-    write_hourly_orders(OUT / "test_hourly_2zone.csv")
-    write_block_orders(OUT / "test_blocks_2zone.csv")
+    main()

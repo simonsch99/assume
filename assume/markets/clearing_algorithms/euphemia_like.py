@@ -872,7 +872,7 @@ class ComplexClearingRole(MarketRole):
             if all(order_surplus >= 0 for order_surplus in orders_surplus):
                 break
 
-        accepted_orders, rejected_orders, meta, flows = extract_results(
+        accepted_orders, rejected_orders, meta, flows, line_results = extract_results(
             model=instance,
             orders=orderbook,
             rejected_orders=rejected_orders,
@@ -880,8 +880,11 @@ class ComplexClearingRole(MarketRole):
             market_clearing_prices=market_clearing_prices,
             pricing_mechanism=self.pricing_mechanism,
             log_flows=self.log_flows,
+            line_tariffs=self.line_tariffs,
+            line_losses=self.line_losses,
         )
 
+        self.line_results = line_results
         self.all_orders = []
 
         return accepted_orders, rejected_orders, meta, flows
@@ -952,7 +955,7 @@ def calculate_order_surplus(
                     market_clearing_prices[child_order["node"]][t] * v
                     for t, v in child_order["volume"].items()
                 )
-                - child_order["price"] * bid_volume
+                - child_order["price"] * sum(child_order["volume"].values()) #  TODO Check if this fix is correct, was '*bid_volume' before
             ) * pyo.value(instance.xb[child_order["bid_id"]])
             if child_surplus > 0:
                 order_surplus += child_surplus
@@ -972,6 +975,8 @@ def extract_results(
     market_clearing_prices: dict,
     pricing_mechanism: str = "pay_as_clear",
     log_flows: bool = False,
+    line_tariffs: dict = None,
+    line_losses: dict = None,
 ):
     """
     Extracts the results of the market clearing from the solved pyomo model.
@@ -1087,16 +1092,43 @@ def extract_results(
             )
 
     flows_filtered = {}
+    line_results = []
 
-    if log_flows:
-        # extract flows
+    if log_flows and hasattr(model, "flows"):
+        flows_filtered = {
+            index: flow.value
+            for index, flow in model.flows.items()
+            if not flow.stale
+        }
 
-        # Check if the model has the 'flows' attribute
-        if hasattr(model, "flows"):
-            flows = model.flows
+        # per-line tariff and loss accounting
+        for (t, line), flow in flows_filtered.items():
+            tariff_rate = (line_tariffs or {}).get(line, 0.0)
+            gamma = (line_losses or {}).get(line, 0.0)
 
-            flows_filtered = {
-                index: flow.value for index, flow in flows.items() if not flow.stale
-            }
+            if line in getattr(model, "split_lines", []):
+                f_pos = pyo.value(model.flow_pos[t, line])
+                f_neg = pyo.value(model.flow_neg[t, line])
+            else:
+                f_pos = max(flow, 0.0)
+                f_neg = max(-flow, 0.0)
 
-    return accepted_orders, rejected_orders, meta, flows_filtered
+            transported = f_pos + f_neg
+            tariff_cost = tariff_rate * transported
+            losses = gamma * transported
+
+            line_results.append(
+                {
+                    "time": t,
+                    "line": line,
+                    "flow": flow,
+                    "flow_pos": f_pos,
+                    "flow_neg": f_neg,
+                    "tariff_rate": tariff_rate,
+                    "tariff_cost": tariff_cost,
+                    "loss_rate": gamma,
+                    "losses": losses,
+                }
+            )
+
+    return accepted_orders, rejected_orders, meta, flows_filtered, line_results
