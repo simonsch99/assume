@@ -1,689 +1,1443 @@
-### This clearing algorithm is an extended version of the comnplex_clearing.py with more extensive grid simulation and exclusive group orders.
-
-
 # SPDX-FileCopyrightText: ASSUME Developers
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
+"""
+EUPHEMIA-like market clearing with NTC, FBMC, and hybrid coupling.
+
+Simple bids are continuous period-order decisions:
+
+- in-the-money simple bids are fully accepted;
+- out-of-the-money simple bids are rejected;
+- at-the-money simple bids may be accepted, partially accepted, or rejected.
+
+Block bids retain binary activation and minimum-acceptance-ratio logic.
+"""
+
 import logging
-from collections import defaultdict # TODO Check if this can be done in base py
+from collections import defaultdict
 from datetime import timedelta
 from operator import itemgetter
+from pathlib import Path
 
 import pandas as pd
 import pyomo.environ as pyo
+import pypsa
 from mango import AgentAddress
-from pyomo.opt import OptSolver, SolverFactory, TerminationCondition
+from pyomo.opt import OptSolver, SolverFactory
 
+from assume.common.fbmc_utils_version4 import (
+    precompute_fbmc_parameters,
+    to_clearing_input,
+)
 from assume.common.market_objects import MarketConfig, MarketProduct, Orderbook
-from assume.common.utils import create_incidence_matrix, get_supported_solver_pyomo
+from assume.common.utils import get_supported_solver_pyomo
 from assume.markets.base_market import MarketRole
 
-# Set the log level to WARNING
 logging.getLogger("pyomo").setLevel(logging.WARNING)
 logging.getLogger("gurobipy").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-EPS = 1e-4
+EPS = 1e-5 # TODO Decide on a good value
 
 
 def get_exclusive_groups(orders: Orderbook) -> dict[object, list[str]]:
-    """
-    Collects the exclusive groups of block bids from the orderbook.
-
-    Only block bids ('BB' and 'LB') can be part of an exclusive group. The group
-    membership is defined by the optional order field ``exclusive_group_id``.
-    Orders without this field or with ``exclusive_group_id`` set to None are ignored.
-
-    Args:
-        orders (Orderbook): The list of the orders.
-
-    Returns:
-        dict[object, list[str]]: A mapping of the exclusive group id to the list of bid ids
-            belonging to this group. Groups containing less than two bids are dropped,
-            since the constraint would be redundant.
-
-    Note:
-        Exclusive groups model the EUPHEMIA rule that at most one bid of a group of
-        mutually exclusive block bids may be accepted.
-    """
+    """Return block-bid IDs grouped by exclusive_group_id."""
     groups: dict[object, list[str]] = defaultdict(list)
-    for order in orders:
-        if order["bid_type"] not in ["BB", "LB"]:
-            continue
-        group_id = order.get("exclusive_group_id")
-        if group_id is None:
-            continue
-        groups[group_id].append(order["bid_id"])
 
-    # drop groups with a single member, as the constraint is redundant there
+    for order in orders:
+        if order["bid_type"] in ["BB", "LB"]:
+            group_id = order.get("exclusive_group_id")
+
+            if group_id is not None:
+                groups[group_id].append(order["bid_id"])
+
     return {
-        group_id: bid_ids for group_id, bid_ids in groups.items() if len(bid_ids) > 1
+        group_id: bid_ids
+        for group_id, bid_ids in groups.items()
+        if len(bid_ids) > 1
     }
 
 
-def _get_line_capacity(line_id: str, lines: pd.DataFrame, line_methods: dict, timestep):
-    """
-    Determines the transmission capacity for a line based on the capacity method.
-    
-    Args:
-        line_id (str): The line identifier.
-        lines (pd.DataFrame): The lines DataFrame containing capacity data.
-        line_methods (dict): Mapping of line_id to capacity method ("ATC" or "FBMC").
-        timestep: The current timestep (for future FBMC time-variant support).
-    
-    Returns:
-        float: The capacity in MW.
-    """
-    method = line_methods.get(line_id, "ATC") if line_methods else "ATC"
-    
-    if method == "ATC":
-        # ATC: Available Transfer Capacity (current implementation)
-        s_max_pu = (
-            lines.at[line_id, "s_max_pu"]
-            if "s_max_pu" in lines.columns and not pd.isna(lines.at[line_id, "s_max_pu"])
-            else 1.0
-        )
-        return lines.at[line_id, "s_nom"] * s_max_pu
-    
-    elif method == "FBMC":
-        # FBMC: Flow-Based Market Coupling (placeholder for future implementation)
-        # For now, use same logic as ATC
-        # TODO: Implement FBMC-specific logic (e.g., load flow constraints, PTDF matrix)
-        s_max_pu = (
-            lines.at[line_id, "s_max_pu"]
-            if "s_max_pu" in lines.columns and not pd.isna(lines.at[line_id, "s_max_pu"])
-            else 1.0
-        )
-        capacity = lines.at[line_id, "s_nom"] * s_max_pu
-        logger.debug(f"FBMC capacity for {line_id} at {timestep}: {capacity} MW (placeholder)")
-        return capacity
-    
+def load_ntc_connections(
+    ntc_connections: str | Path | pd.DataFrame | None,
+    snapshots: pd.Index,
+) -> dict:
+    """Load and validate time-dependent NTC connection data."""
+    empty_result = {
+        "line_ids": [],
+        "zone_ids": [],
+        "from_zone": {},
+        "to_zone": {},
+        "capacity_up": {},
+        "capacity_down": {},
+    }
+
+    if ntc_connections is None:
+        return empty_result
+
+    if isinstance(ntc_connections, (str, Path)):
+        ntc_data = pd.read_csv(ntc_connections)
+    elif isinstance(ntc_connections, pd.DataFrame):
+        ntc_data = ntc_connections.copy()
     else:
-        logger.warning(f"Unknown capacity method '{method}' for line {line_id}. Defaulting to ATC.")
-        s_max_pu = (
-            lines.at[line_id, "s_max_pu"]
-            if "s_max_pu" in lines.columns and not pd.isna(lines.at[line_id, "s_max_pu"])
-            else 1.0
+        raise TypeError(
+            "ntc_connections must be None, a pandas DataFrame, or a CSV path."
         )
-        return lines.at[line_id, "s_nom"] * s_max_pu
 
-def _line_balance_terms(model, incidence_matrix, line_losses, node, t):
-    """
-    Network contribution to the energy balance of `node` at time `t`,
-    following Chatzigiannis et al. (2016), Eq. (13) / (15).
+    required_columns = {
+        "line_id",
+        "from_zone",
+        "to_zone",
+        "timestamp",
+        "capacity_up",
+        "capacity_down",
+    }
+    missing_columns = required_columns.difference(ntc_data.columns)
 
-    Sign convention (ASSUME): incidence[node, line] == -1 -> line starts at node
-    (theta), == +1 -> line ends at node (phi). Volumes are positive for supply,
-    so an export must appear with a positive sign in the balance expression
-    (balance == 0).
-    """
-    expr = 0.0
-    for line in model.lines:
-        inc = incidence_matrix.loc[node, line]
-        if inc == 0:
-            continue
+    if missing_columns:
+        raise ValueError(
+            "NTC data is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
 
-        gamma = (line_losses or {}).get(line, 0.0)
+    if pd.api.types.is_datetime64_any_dtype(snapshots):
+        ntc_data["timestamp"] = pd.to_datetime(ntc_data["timestamp"])
 
-        if line not in model.split_lines:
-            expr += inc * model.flows[t, line]
-            continue
+    ntc_data = ntc_data.set_index(["timestamp", "line_id"], drop=False)
 
-        f_pos = model.flow_pos[t, line]
-        f_neg = model.flow_neg[t, line]
+    if ntc_data.index.has_duplicates:
+        duplicates = ntc_data.index[ntc_data.index.duplicated()].tolist()
+        raise ValueError(
+            "NTC data contains duplicate (timestamp, line_id) rows. "
+            f"Examples: {duplicates[:5]}"
+        )
 
-        if inc < 0:
-            # node is the origin (theta == 1): full export, lossy import
-            expr += -(f_pos - (1.0 - gamma) * f_neg)
-        else:
-            # node is the destination (phi == 1): lossy import, full export
-            expr += (1.0 - gamma) * f_pos - f_neg
-    return expr
+    line_ids = pd.Index(ntc_data["line_id"].unique())
+    zone_ids = pd.Index(
+        pd.concat([ntc_data["from_zone"], ntc_data["to_zone"]]).unique()
+    )
+
+    from_zone = {}
+    to_zone = {}
+    capacity_up = {}
+    capacity_down = {}
+
+    for line_id in line_ids:
+        line_data = ntc_data[ntc_data["line_id"] == line_id]
+        from_zones = line_data["from_zone"].unique()
+        to_zones = line_data["to_zone"].unique()
+
+        if len(from_zones) != 1 or len(to_zones) != 1:
+            raise ValueError(
+                f"NTC line '{line_id}' must have one fixed from_zone and "
+                "one fixed to_zone for all timestamps."
+            )
+
+        from_zone[line_id] = from_zones[0]
+        to_zone[line_id] = to_zones[0]
+
+        for timestamp in snapshots:
+            key = (timestamp, line_id)
+
+            if key not in ntc_data.index:
+                raise ValueError(
+                    f"NTC data has no capacity row for line '{line_id}' "
+                    f"at timestamp '{timestamp}'."
+                )
+
+            row = ntc_data.loc[key]
+
+            if pd.isna(row["capacity_up"]) or pd.isna(row["capacity_down"]):
+                raise ValueError(
+                    f"NTC capacities must not be null for line '{line_id}' "
+                    f"at timestamp '{timestamp}'."
+                )
+
+            if row["capacity_up"] < 0 or row["capacity_down"] < 0:
+                raise ValueError(
+                    f"NTC capacities must be non-negative for line '{line_id}' "
+                    f"at timestamp '{timestamp}'."
+                )
+
+            capacity_up[key] = float(row["capacity_up"])
+            capacity_down[key] = float(row["capacity_down"])
+
+    return {
+        "line_ids": list(line_ids),
+        "zone_ids": list(zone_ids),
+        "from_zone": from_zone,
+        "to_zone": to_zone,
+        "capacity_up": capacity_up,
+        "capacity_down": capacity_down,
+    }
 
 
-def _add_line_tariffs_to_objective(
-    obj_expr,
+def _get_order_net_position_expression(
     model: pyo.ConcreteModel,
-    line_tariffs: dict,
-    market_products: list[MarketProduct],
+    orders: Orderbook,
+    zone: str,
+    timestamp,
 ):
-    """
-    Adds tariff costs to the objective function.
-    
-    Tariffs are charged per MWh transported on each line.
-    
-    Args:
-        obj_expr: The current objective expression
-        model: The Pyomo model
-        line_tariffs: Dict mapping line_id to tariff (€/MWh)
-        market_products: List of market products (for duration)
-    
-    Returns:
-        Updated objective expression with tariff costs
-    """
-    if not line_tariffs or not any(line_tariffs.values()):
-        return obj_expr
-    for t in model.T:
-        for line in model.split_lines:
-            tariff = line_tariffs.get(line, 0.0)
-            if tariff == 0.0:
-                continue
-            obj_expr += tariff * (model.flow_pos[t, line] + model.flow_neg[t, line])
-    return obj_expr
+    """Build accepted supply-minus-demand volume for one zone/time."""
+    expression = 0.0
 
-    
+    for order in orders:
+        if (
+            order["bid_type"] == "SB"
+            and order["node"] == zone
+            and order["start_time"] == timestamp
+        ):
+            expression += order["volume"] * model.xs[order["bid_id"]]
+
+        elif (
+            order["bid_type"] in ["BB", "LB"]
+            and order["node"] == zone
+            and timestamp in order["volume"]
+        ):
+            expression += (
+                order["volume"][timestamp] * model.xb[order["bid_id"]]
+            )
+
+    return expression
+
+
 def market_clearing_opt_constraints(
     model: pyo.ConcreteModel,
     orders: Orderbook,
     market_products: list[MarketProduct],
-    mode: str,
     with_linked_bids: bool,
     with_exclusive_groups: bool,
-    incidence_matrix: pd.DataFrame,
-    lines: pd.DataFrame,
-    line_methods: dict = None,
-    line_losses: dict = None,
-    line_tariffs: dict = None,
-    line_ramping: dict = None,
+    market_zone_ids: list[str],
+    fbmc_params: dict | None = None,
+    ntc_params: dict | None = None,
 ):
-    """
-    Adds the constraints to the model.
-    Used by :meth:`market_clearing_opt`.
-    """
-    # Set nodes and lines based on the incidence matrix and lines DataFrame
-    if incidence_matrix is not None:
-        nodes = list(incidence_matrix.index)
-        line_ids = list(incidence_matrix.columns)
-    else:
-        nodes = ["node0"]
-        line_ids = ["line0"]
+    """Add market, NTC, FBMC, hybrid-balance, and block constraints."""
+    snapshots = [product[0] for product in market_products]
+    fbmc_params = fbmc_params or {}
+    ntc_params = ntc_params or {}
 
-    # add dual suffix to the model (we need this to extract the market clearing prices later)
-    # if mode is not 'with_min_acceptance_ratio', otherwise the dual suffix is added later
-    if mode != "with_min_acceptance_ratio":
-        model.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT_EXPORT)
+    fbmc_zone_ids = list(fbmc_params.get("fbmc_zone_ids", []))
+    cnec_list = list(fbmc_params.get("cnec_list", []))
+    ntc_line_ids = list(ntc_params.get("line_ids", []))
 
-    model.T = pyo.Set(
-        initialize=[market_product[0] for market_product in market_products],
-        doc="timesteps",
-    )
+    model.T = pyo.Set(initialize=snapshots, ordered=True)
+    model.zones = pyo.Set(initialize=market_zone_ids, ordered=True)
+    model.fbmc_zones = pyo.Set(initialize=fbmc_zone_ids, ordered=True)
+    model.cnecs = pyo.Set(initialize=cnec_list, ordered=True)
+    model.ntc_lines = pyo.Set(initialize=ntc_line_ids, ordered=True)
 
     model.sBids = pyo.Set(
-        initialize=[order["bid_id"] for order in orders if order["bid_type"] == "SB"],
-        doc="simple_bids",
+        initialize=[
+            order["bid_id"]
+            for order in orders
+            if order["bid_type"] == "SB"
+        ]
     )
-
     model.bBids = pyo.Set(
         initialize=[
-            order["bid_id"] for order in orders if order["bid_type"] in ["BB", "LB"]
-        ],
-        doc="block_bids",
+            order["bid_id"]
+            for order in orders
+            if order["bid_type"] in ["BB", "LB"]
+        ]
     )
 
-    model.nodes = pyo.Set(initialize=nodes, doc="nodes")
-    model.lines = pyo.Set(initialize=line_ids, doc="lines")
-
-    # decision variables for the acceptance ratio of simple and block bids (including linked bids)
     model.xs = pyo.Var(
         model.sBids,
         domain=pyo.NonNegativeReals,
-        bounds=(0, 1),
-        doc="simple_bid_acceptance",
+        bounds=(0.0, 1.0),
     )
-
+    model.x = pyo.Var(model.bBids, domain=pyo.Binary)
     model.xb = pyo.Var(
         model.bBids,
         domain=pyo.NonNegativeReals,
-        bounds=(0, 1),
-        doc="block_bid_acceptance",
+        bounds=(0.0, 1.0),
+    )
+    model.net_position = pyo.Var(
+        model.T,
+        model.zones,
+        domain=pyo.Reals,
     )
 
-    # decision variables that define flows between nodes
-    # assuming the orders contain the node and are collected in nodes
-    if incidence_matrix is not None:
-        # Decision variables for flows on each line at each timestep
-        model.flows = pyo.Var(model.T, model.lines, domain=pyo.Reals, doc="power_flows")
-
-        # lines with losses or tariffs need the positive/negative decomposition
-        lossy_lines = [
-            line for line in line_ids
-            if (line_losses or {}).get(line, 0.0) > 0.0
-            or (line_tariffs or {}).get(line, 0.0) > 0.0
-        ]
-        model.split_lines = pyo.Set(initialize=lossy_lines, doc="lines_with_flow_split")
-
-        model.flow_pos = pyo.Var(
-            model.T, model.split_lines, domain=pyo.NonNegativeReals, doc="flow_forward"
-        )
-        model.flow_neg = pyo.Var(
-            model.T, model.split_lines, domain=pyo.NonNegativeReals, doc="flow_backward"
+    if fbmc_zone_ids:
+        model.net_export_fb = pyo.Var(
+            model.T,
+            model.fbmc_zones,
+            domain=pyo.Reals,
         )
 
-        model.flow_split_constr = pyo.ConstraintList()
-        for t in model.T:
-            for line in model.split_lines:
-                model.flow_split_constr.add(
-                    model.flows[t, line]
-                    == model.flow_pos[t, line] - model.flow_neg[t, line]
-                )
-
-    if mode == "with_min_acceptance_ratio":
-        model.Bids = pyo.Set(
-            initialize=[order["bid_id"] for order in orders], doc="all_bids"
-        )
-        # decision variables for the acceptance as binary variable
-        model.x = pyo.Var(
-            model.Bids,
-            domain=pyo.Binary,
-            doc="bid_accepted",
+    if ntc_line_ids:
+        model.ntc_flow = pyo.Var(
+            model.T,
+            model.ntc_lines,
+            domain=pyo.Reals,
         )
 
-        # add minimum acceptance ratio constraints
-        model.mar_constr = pyo.ConstraintList()
-        for order in orders:
-            if order["min_acceptance_ratio"] is None:
-                continue
-            elif order["bid_type"] == "SB":
-                model.mar_constr.add(
-                    model.xs[order["bid_id"]]
-                    >= order["min_acceptance_ratio"] * model.x[order["bid_id"]]
-                )
-                model.mar_constr.add(
-                    model.xs[order["bid_id"]] <= model.x[order["bid_id"]]
-                )
+    model.block_mar_constraints = pyo.ConstraintList()
 
-            elif order["bid_type"] in ["BB", "LB"]:
-                model.mar_constr.add(
-                    model.xb[order["bid_id"]]
-                    >= order["min_acceptance_ratio"] * model.x[order["bid_id"]]
-                )
-                model.mar_constr.add(
-                    model.xb[order["bid_id"]] <= model.x[order["bid_id"]]
-                )
+    for order in orders:
+        if order["bid_type"] not in ["BB", "LB"]:
+            continue
 
-    # limit the acceptance of child bids by the acceptance of their parent bid
+        mar = order.get("min_acceptance_ratio", 1.0)
+
+        if mar is None:
+            mar = 1.0
+
+        bid_id = order["bid_id"]
+        model.block_mar_constraints.add(
+            model.xb[bid_id] >= mar * model.x[bid_id]
+        )
+        model.block_mar_constraints.add(
+            model.xb[bid_id] <= model.x[bid_id]
+        )
+
     if with_linked_bids:
-        model.linked_bid_constr = pyo.ConstraintList()
+        model.linked_bid_constraints = pyo.ConstraintList()
+
         for order in orders:
-            if "parent_bid_id" in order.keys() and order["parent_bid_id"] is not None:
-                parent_bid_id = order["parent_bid_id"]
-                model.linked_bid_constr.add(
-                    model.xb[order["bid_id"]] <= model.xb[parent_bid_id]
-                )
+            parent_bid_id = order.get("parent_bid_id")
 
-    # limit the acceptance of mutually exclusive block bids to at most one bid per group
-    if with_exclusive_groups:
-        exclusive_groups = get_exclusive_groups(orders)
-        model.exclusive_group_constr = pyo.ConstraintList()
-        for group_id, bid_ids in exclusive_groups.items():
-            # only consider bids that are still part of the model
-            bid_ids = [bid_id for bid_id in bid_ids if bid_id in model.bBids]
-            if len(bid_ids) < 2:
-                continue
-            if mode == "with_min_acceptance_ratio": # TODO Check if this is correct 
-                # if binaries are available, the stricter formulation on the
-                # acceptance indicators is used (at most one bid selected)
-                model.exclusive_group_constr.add(
-                    sum(model.x[bid_id] for bid_id in bid_ids) <= 1
-                )
-            else:
-                # without binaries the acceptance ratios of the group are limited
-                model.exclusive_group_constr.add(
-                    sum(model.xb[bid_id] for bid_id in bid_ids) <= 1
-                )
-
-    # Function to calculate the balance for each node and time
-    def energy_balance_rule(model, node, t):
-        """
-        Calculate the energy balance for a given node and time.
-
-        This function calculates the energy balance for a specific node and time in a complex clearing algorithm. It iterates over the orders and adjusts the balance expression based on the bid type. It also adjusts the flow subtraction to account for actual connections if an incidence matrix is provided.
-
-        Args:
-            model: The complex clearing model.
-            node: The node for which to calculate the energy balance.
-            t: The time for which to calculate the energy balance.
-
-        Returns:
-            bool: True if the energy balance is zero, False otherwise.
-        """
-        balance_expr = 0.0  # Initialize the balance expression
-        # Iterate over orders to adjust the balance expression based on bid type
-        for order in orders:
             if (
-                order["bid_type"] == "SB"
-                and order["node"] == node
-                and order["start_time"] == t
+                order["bid_type"] in ["BB", "LB"]
+                and parent_bid_id in model.bBids
             ):
-                balance_expr += order["volume"] * model.xs[order["bid_id"]]
-            elif order["bid_type"] in ["BB", "LB"] and order["node"] == node:
-                for start_time, volume in order["volume"].items():
-                    if start_time == t:
-                        balance_expr += volume * model.xb[order["bid_id"]]
+                model.linked_bid_constraints.add(
+                    model.xb[order["bid_id"]]
+                    <= model.xb[parent_bid_id]
+                )
 
-        # Add contributions from line flows based on the incidence matrix
-        if incidence_matrix is not None:
-            balance_expr += _line_balance_terms(
-                model, incidence_matrix, line_losses, node, t
+    if with_exclusive_groups:
+        model.exclusive_group_constraints = pyo.ConstraintList()
+
+        for bid_ids in get_exclusive_groups(orders).values():
+            model.exclusive_group_constraints.add(
+                sum(model.xb[bid_id] for bid_id in bid_ids) <= 1
             )
 
-        return balance_expr == 0
+    def net_position_rule(model, zone, timestamp):
+        return model.net_position[timestamp, zone] == (
+            _get_order_net_position_expression(
+                model=model,
+                orders=orders,
+                zone=zone,
+                timestamp=timestamp,
+            )
+        )
 
-    # Add the energy balance constraints for each node and time period using the rule
-    # Define the energy balance constraint using two indices (node and time)
-    model.energy_balance = pyo.Constraint(
-        model.nodes, model.T, rule=energy_balance_rule
+    model.net_position_definition = pyo.Constraint(
+        model.zones,
+        model.T,
+        rule=net_position_rule,
     )
 
-    if incidence_matrix is not None:
-        # add capacities and ramping constraints
-        model.transmission_constr = pyo.ConstraintList()
-        model.ramping_constr = pyo.ConstraintList()
-        for t in model.T:
-            for line in model.lines:
-                capacity = _get_line_capacity(line, lines, line_methods, t)
-                # Limit the flow on each line
-                model.transmission_constr.add(model.flows[t, line] <= capacity)
-                model.transmission_constr.add(model.flows[t, line] >= -capacity)
+    if ntc_line_ids:
+        model.ntc_capacity_constraints = pyo.ConstraintList()
 
-        if line_ramping is not None and any(v is not None for v in line_ramping.values()):
-            t_list = sorted(model.T)
-            for idx in range (len(t_list) - 1):
-                t_current = t_list[idx]
-                t_next = t_list[idx + 1]
+        for timestamp in model.T:
+            for line_id in model.ntc_lines:
+                model.ntc_capacity_constraints.add(
+                    model.ntc_flow[timestamp, line_id]
+                    <= ntc_params["capacity_up"][(timestamp, line_id)]
+                )
+                model.ntc_capacity_constraints.add(
+                    model.ntc_flow[timestamp, line_id]
+                    >= -ntc_params["capacity_down"][(timestamp, line_id)]
+                )
 
-                for line in model.lines:
-                    ramp_limit = line_ramping.get(line)
-                    if ramp_limit is None or pd.isna(ramp_limit) or ramp_limit <= 0:
-                        continue
-                    # Calculate time delta in hours TODO check if this is needed
-                    time_delta = (t_next - t_current) / timedelta(hours=1)
-                    max_change = ramp_limit * time_delta
-                    # Ramping constraints: Absolute flow change <= max_change
-                    model.ramping_constr.add(
-                        model.flows[t_next, line] - model.flows[t_current, line] <= max_change
+    if fbmc_zone_ids:
+
+        def fb_balance_rule(model, timestamp):
+            return sum(
+                model.net_export_fb[timestamp, zone]
+                for zone in model.fbmc_zones
+            ) == 0.0
+
+        model.fb_balance = pyo.Constraint(model.T, rule=fb_balance_rule)
+        model.fbmc_constraints = pyo.ConstraintList()
+
+        for timestamp in model.T:
+            for cnec in model.cnecs:
+                model.fbmc_constraints.add(
+                    sum(
+                        fbmc_params["ptdf_zonal"][(timestamp, cnec, zone)]
+                        * model.net_export_fb[timestamp, zone]
+                        for zone in model.fbmc_zones
                     )
-                    model.ramping_constr.add(
-                        model.flows[t_next, line] - model.flows[t_current, line] >= -max_change
-                    )
+                    <= fbmc_params["ram"][(timestamp, cnec)]
+                )
+
+    def zonal_balance_rule(model, zone, timestamp):
+        ntc_export = sum(
+            model.ntc_flow[timestamp, line_id]
+            for line_id in model.ntc_lines
+            if ntc_params["from_zone"][line_id] == zone
+        ) - sum(
+            model.ntc_flow[timestamp, line_id]
+            for line_id in model.ntc_lines
+            if ntc_params["to_zone"][line_id] == zone
+        )
+
+        fb_export = (
+            model.net_export_fb[timestamp, zone]
+            if zone in model.fbmc_zones
+            else 0.0
+        )
+
+        return model.net_position[timestamp, zone] == fb_export + ntc_export
+
+    model.zonal_balance = pyo.Constraint(
+        model.zones,
+        model.T,
+        rule=zonal_balance_rule,
+    )
 
 
-def market_clearing_opt_objective(model: pyo.ConcreteModel, orders: Orderbook, line_tariffs: dict = None,):
-    """
-    Define the objective function as cost minimization
-    Used by :meth:`market_clearing_opt`
-    """
-    obj_expr = 0
+def _build_welfare_expression(
+    model: pyo.ConcreteModel,
+    orders: Orderbook,
+):
+    welfare = 0.0
+
     for order in orders:
         if order["bid_type"] == "SB":
-            obj_expr += order["price"] * order["volume"] * model.xs[order["bid_id"]]
+            welfare += (
+                -order["price"]
+                * order["volume"]
+                * model.xs[order["bid_id"]]
+            )
+
         elif order["bid_type"] in ["BB", "LB"]:
-            for start_time, volume in order["volume"].items():
-                obj_expr += order["price"] * volume * model.xb[order["bid_id"]]
+            welfare += sum(
+                -order["price"] * volume * model.xb[order["bid_id"]]
+                for volume in order["volume"].values()
+            )
 
-    # Add tariff costs if tariffs are defined
-    if line_tariffs is not None and any(line_tariffs.values()):
-        obj_expr = _add_line_tariffs_to_objective(obj_expr, model, line_tariffs, [])
-    
+    return welfare
 
-    model.objective = pyo.Objective(expr=obj_expr, sense=pyo.minimize)
+
+def market_clearing_opt_objective(
+    model: pyo.ConcreteModel,
+    orders: Orderbook,
+):
+    """Maximise welfare with positive supply and negative demand volumes."""
+    model.welfare = pyo.Expression(
+        expr=_build_welfare_expression(model, orders)
+    )
+    model.objective = pyo.Objective(
+        expr=model.welfare,
+        sense=pyo.maximize,
+    )
+
+
+def build_market_clearing_model(
+    orders: Orderbook,
+    market_products: list[MarketProduct],
+    with_linked_bids: bool,
+    with_exclusive_groups: bool,
+    market_zone_ids: list[str],
+    fbmc_params: dict | None = None,
+    ntc_params: dict | None = None,
+    func_constraints=market_clearing_opt_constraints,
+    func_objective=market_clearing_opt_objective,
+):
+    """Build the welfare-maximising master model."""
+    model = pyo.ConcreteModel()
+
+    func_constraints(
+        model=model,
+        orders=orders,
+        market_products=market_products,
+        with_linked_bids=with_linked_bids,
+        with_exclusive_groups=with_exclusive_groups,
+        market_zone_ids=market_zone_ids,
+        fbmc_params=fbmc_params,
+        ntc_params=ntc_params,
+    )
+    func_objective(model=model, orders=orders)
+    model.price_feasibility_cuts = pyo.ConstraintList()
+
+    return model
 
 
 def market_clearing_opt(
     orders: Orderbook,
     market_products: list[MarketProduct],
-    mode: str,
     with_linked_bids: bool,
     with_exclusive_groups: bool,
-    incidence_matrix: pd.DataFrame = None,
-    lines: pd.DataFrame = None,
-    line_methods: dict = None,
-    line_losses: dict = None,
-    line_tariffs: dict = None,
-    line_ramping: dict = None,
-    solver: OptSolver = None,
-    solver_options: dict = {},
+    market_zone_ids: list[str],
+    fbmc_params: dict | None = None,
+    ntc_params: dict | None = None,
+    solver: OptSolver | None = None,
+    solver_options: dict | None = None,
     func_constraints=market_clearing_opt_constraints,
     func_objective=market_clearing_opt_objective,
 ):
-    """
-    Sets up and solves the market clearing optimization problem.
+    """Build and solve one welfare-master optimisation model."""
+    if solver is None:
+        raise ValueError("A Pyomo solver instance must be provided.")
 
-    Args:
-        orders (Orderbook): The list of the orders.
-        market_products (list[MarketProduct]): The products to be traded.
-        mode (str): The mode of the market clearing determining whether the minimum acceptance ratio is considered.
-        with_linked_bids (bool): Whether the market clearing should include linked bids.
-        with_exclusive_groups (bool): Whether the market clearing should include exclusive groups of block bids.
-        incidence_matrix (pd.DataFrame): The directed incidence matrix of the network.
-        lines (pd.DataFrame): The lines and their capacities of the network.
-        solver (pyomo.opt.OptSolver): Specifies the solver instance to be used for the optimization problem.
-        solver_options (dict): Additional solver options.
-        func_constraints: The function that is executed to add the constraints to the model. Defaults to :meth:`market_clearing_opt_constraints`.
-        func_objective: The function that is executed to add the objective function to the model. Defaults to :meth:`market_clearing_opt_objective`.
+    model = build_market_clearing_model(
+        orders=orders,
+        market_products=market_products,
+        with_linked_bids=with_linked_bids,
+        with_exclusive_groups=with_exclusive_groups,
+        market_zone_ids=market_zone_ids,
+        fbmc_params=fbmc_params,
+        ntc_params=ntc_params,
+        func_constraints=func_constraints,
+        func_objective=func_objective,
+    )
+    results = solver.solve(model, options=solver_options or {})
 
-    Returns:
-        tuple[pyomo.core.base.PyomoModel.ConcreteModel, pyomo.opt.results.SolverResults]: The solved pyomo model and the solver results
+    return model, results
 
-    Note:
-        The problem is formulated as a mixed-integer linear program (MILP) and solved using the pyomo package.
-        The objective function is to maximize the social welfare and defined as the sum of the product of the price, volume, and acceptance ratio of each order.
-        The decision variables are given by the acceptance ratio of each order bounded by 0 and 1 and the acceptance as a binary variable.
 
-        The energy balance constraint ensures that the sum of the accepted volumes of all orders is zero.
-        The acceptance of each order is bounded by 0 and 1.
+def _result_is_infeasible(results) -> bool:
+    termination = str(results.solver.termination_condition).lower()
+    return "infeasible" in termination or "unbounded" in termination
 
-        If the mode is 'with_min_acceptance_ratio', the minimum acceptance ratio is considered.
-        The minimum acceptance ratio is defined as the ratio of the minimum volume to accept to the total volume of the order.
 
-        If linked bids are considered, the acceptance of a child bid is bounded by the acceptance of its parent bid.
+def _result_has_solution(results) -> bool:
+    termination = str(results.solver.termination_condition).lower()
 
-        If exclusive groups are considered, at most one block bid of each exclusive group can be accepted.
-
-        The market clearing is solved using pyomo with the specified solver_name (HIGHS is used by default).
-        If the specified solver is not available, the model is solved using available solver.
-        If none of the solvers are available, an exception is raised.
-
-        After solving the model, the acceptance of each order is fixed to the value in the solution and the model is solved again.
-        This removes all binary variables from the model and allows to extract the market clearing prices from the dual variables of the energy balance constraint.
-
-    """
-    model = pyo.ConcreteModel()
-
-    func_constraints(
-        model,
-        orders,
-        market_products,
-        mode,
-        with_linked_bids,
-        with_exclusive_groups,
-        incidence_matrix,
-        lines,
-        line_methods,
-        line_losses,
-        line_tariffs,
-        line_ramping,
+    return not any(
+        failure in termination
+        for failure in [
+            "infeasible",
+            "unbounded",
+            "invalid",
+            "error",
+        ]
     )
 
-    func_objective(model, orders, line_tariffs)
 
-    # Solve the model
-    instance = model.create_instance()
-    results = solver.solve(instance, options=solver_options)
+def _solve_checked(
+    solver: OptSolver,
+    model: pyo.ConcreteModel,
+    solver_options: dict,
+    context: str,
+):
+    try:
+        results = solver.solve(model, options=solver_options)
+    except Exception as exc:
+        raise Exception(f"{context} failed: {exc}") from exc
 
-    # Fix all model.x to the values in the solution
-    if mode == "with_min_acceptance_ratio":
-        # Add dual suffix to the model (needed to extract duals later)
-        instance.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT_EXPORT)
+    if not _result_has_solution(results):
+        raise Exception(
+            f"{context} did not produce a feasible solution "
+            f"({results.solver.termination_condition})."
+        )
 
-        for bid_id in instance.Bids:
-            # Fix the binary variable to its value
-            value = instance.x[bid_id].value
-            if value is not None:
-                value = 1 if value >= 0.99 else 0
-            instance.x[bid_id].fix(value)
-            # Change the domain to Reals (or appropriate continuous domain)
-            instance.x[bid_id].domain = pyo.Reals
+    return results
 
-        # Resolve the model
-        results = solver.solve(instance, options=solver_options)
 
-    return instance, results
+def _collect_master_solution(model: pyo.ConcreteModel) -> dict:
+    """Extract the primal solution required by pricing and tie-breaking."""
+    selected_x = {
+        bid_id: int(pyo.value(model.x[bid_id]) >= 0.5) # Converts numeric value into binary block-activation
+        for bid_id in model.bBids
+    }
+    simple_acceptance = {
+        bid_id: min(1.0, max(0.0, float(pyo.value(model.xs[bid_id]))))
+        for bid_id in model.sBids
+    }
+    block_acceptance = {
+        bid_id: min(1.0, max(0.0, float(pyo.value(model.xb[bid_id]))))
+        for bid_id in model.bBids
+    }
+
+    ntc_flow = {}
+    fb_net_export = {}
+
+    if hasattr(model, "ntc_flow"):
+        ntc_flow = {
+            (timestamp, line_id): float(
+                pyo.value(model.ntc_flow[timestamp, line_id])
+            )
+            for timestamp in model.T
+            for line_id in model.ntc_lines
+        }
+
+    if hasattr(model, "net_export_fb"):
+        fb_net_export = {
+            (timestamp, zone): float(
+                pyo.value(model.net_export_fb[timestamp, zone])
+            )
+            for timestamp in model.T
+            for zone in model.fbmc_zones
+        }
+
+    return {
+        "selected_x": selected_x,
+        "simple_acceptance": simple_acceptance,
+        "block_acceptance": block_acceptance,
+        "ntc_flow": ntc_flow,
+        "fb_net_export": fb_net_export,
+    }
+
+
+def build_price_feasibility_model(
+    orders: Orderbook,
+    market_products: list[MarketProduct],
+    market_zone_ids: list[str],
+    fbmc_params: dict | None,
+    ntc_params: dict | None,
+    master_solution: dict,
+    price_floor: float,
+    price_cap: float,
+):
+    """
+    Build the fixed-dispatch price-feasibility model.
+
+    The model contains:
+
+    - simple-order price consistency;
+    - accepted block surplus constraints;
+    - linked-family block-surplus constraints;
+    - NTC flow/price complementarity conditions;
+    - FBMC PTDF congestion-price conditions.
+
+    FBMC price conditions are:
+
+        price[t, z]
+        =
+        fb_reference_price[t]
+        - sum(
+            PTDF[t, cnec, z] * fb_cnec_shadow[t, cnec]
+            for cnec
+        )
+
+    A CNEC shadow price is forced to zero when the corresponding fixed
+    master FB flow is strictly below its RAM. This enforces price
+    convergence in an uncongested FB domain.
+    """
+    fbmc_params = fbmc_params or {}
+    ntc_params = ntc_params or {}
+    snapshots = [product[0] for product in market_products]
+
+    fbmc_zone_ids = list(fbmc_params.get("fbmc_zone_ids", []))
+    cnec_list = list(fbmc_params.get("cnec_list", []))
+
+    model = pyo.ConcreteModel()
+    model.T = pyo.Set(initialize=snapshots, ordered=True)
+    model.zones = pyo.Set(initialize=market_zone_ids, ordered=True)
+    model.fbmc_zones = pyo.Set(initialize=fbmc_zone_ids, ordered=True)
+    model.cnecs = pyo.Set(initialize=cnec_list, ordered=True)
+    model.ntc_lines = pyo.Set(
+        initialize=list(ntc_params.get("line_ids", [])),
+        ordered=True,
+    )
+
+    model.price = pyo.Var(
+        model.T,
+        model.zones,
+        domain=pyo.Reals,
+        bounds=(price_floor, price_cap),
+    )
+    model.price_constraints = pyo.ConstraintList()
+
+    # ------------------------------------------------------------------
+    # Simple bids
+    # ------------------------------------------------------------------
+
+    for order in orders:
+        if order["bid_type"] != "SB":
+            continue
+
+        acceptance = master_solution["simple_acceptance"][order["bid_id"]]
+        price = model.price[order["start_time"], order["node"]]
+        bid_price = order["price"]
+        volume = order["volume"]
+
+        if volume == 0:
+            continue
+
+        rejected = acceptance <= EPS
+        full = acceptance >= 1.0 - EPS
+
+        if volume > 0:
+            if rejected:
+                model.price_constraints.add(price <= bid_price)
+            elif full:
+                model.price_constraints.add(price >= bid_price)
+            else:
+                model.price_constraints.add(price == bid_price)
+        else:
+            if rejected:
+                model.price_constraints.add(price >= bid_price)
+            elif full:
+                model.price_constraints.add(price <= bid_price)
+            else:
+                model.price_constraints.add(price == bid_price)
+
+    # ------------------------------------------------------------------
+    # Block and linked-block surplus
+    # ------------------------------------------------------------------
+
+    block_orders = {
+        order["bid_id"]: order
+        for order in orders
+        if order["bid_type"] in ["BB", "LB"]
+    }
+    children_by_parent: dict[str, list[str]] = defaultdict(list)
+
+    for bid_id, order in block_orders.items():
+        parent_bid_id = order.get("parent_bid_id")
+
+        if parent_bid_id in block_orders:
+            children_by_parent[parent_bid_id].append(bid_id)
+
+    block_surplus = {}
+
+    for bid_id, order in block_orders.items():
+        acceptance = master_solution["block_acceptance"][bid_id]
+
+        if acceptance <= EPS:
+            continue
+
+        block_surplus[bid_id] = sum(
+            (
+                model.price[timestamp, order["node"]]
+                - order["price"]
+            )
+            * volume
+            * acceptance
+            for timestamp, volume in order["volume"].items()
+        )
+
+    for bid_id, own_surplus in block_surplus.items():
+        accepted_children = [
+            child_bid_id
+            for child_bid_id in children_by_parent.get(bid_id, [])
+            if child_bid_id in block_surplus
+        ]
+
+        model.price_constraints.add(
+            own_surplus
+            + sum(
+                block_surplus[child_bid_id]
+                for child_bid_id in accepted_children
+            )
+            >= -EPS
+        )
+
+    # ------------------------------------------------------------------
+    # NTC price-flow consistency
+    # ------------------------------------------------------------------
+
+    for timestamp in model.T:
+        for line_id in model.ntc_lines:
+            flow = master_solution["ntc_flow"][(timestamp, line_id)]
+            upper = ntc_params["capacity_up"][(timestamp, line_id)]
+            lower = -ntc_params["capacity_down"][(timestamp, line_id)]
+
+            from_zone = ntc_params["from_zone"][line_id]
+            to_zone = ntc_params["to_zone"][line_id]
+
+            from_price = model.price[timestamp, from_zone]
+            to_price = model.price[timestamp, to_zone]
+
+            if lower + EPS < flow < upper - EPS:
+                model.price_constraints.add(from_price == to_price)
+            else:
+                if flow >= upper - EPS:
+                    model.price_constraints.add(from_price <= to_price)
+
+                if flow <= lower + EPS:
+                    model.price_constraints.add(from_price >= to_price)
+
+    # ------------------------------------------------------------------
+    # FBMC price-network consistency
+    # ------------------------------------------------------------------
+    #
+    # The primal FB constraint is:
+    #
+    #   sum(PTDF[cnec, zone] * net_export_fb[zone]) <= RAM[cnec]
+    #
+    # For a fixed primal dispatch, valid zonal prices satisfy:
+    #
+    #   price[zone]
+    #   =
+    #   common_fb_energy_price
+    #   - sum(PTDF[cnec, zone] * congestion_price[cnec])
+    #
+    # where congestion_price[cnec] >= 0 and must be zero if the CNEC
+    # is not binding. This is the relevant stationarity/complementarity
+    # condition for the simplified FBMC primal model in this file.
+    #
+    # With all CNECs slack, every FB zone has the same price.
+    # ------------------------------------------------------------------
+
+    if fbmc_zone_ids:
+        model.fb_reference_price = pyo.Var(
+            model.T,
+            domain=pyo.Reals,
+            bounds=(price_floor, price_cap),
+        )
+        model.fb_cnec_shadow = pyo.Var(
+            model.T,
+            model.cnecs,
+            domain=pyo.NonNegativeReals,
+        )
+
+        for timestamp in model.T:
+            for cnec in model.cnecs:
+                fb_flow = sum(
+                    fbmc_params["ptdf_zonal"][(timestamp, cnec, zone)]
+                    * master_solution["fb_net_export"][(timestamp, zone)]
+                    for zone in model.fbmc_zones
+                )
+                ram = fbmc_params["ram"][(timestamp, cnec)]
+
+                if fb_flow < ram - EPS:
+                    model.price_constraints.add(
+                        model.fb_cnec_shadow[timestamp, cnec] == 0.0
+                    )
+
+            for zone in model.fbmc_zones:
+                model.price_constraints.add(
+                    model.price[timestamp, zone]
+                    == model.fb_reference_price[timestamp]
+                    - sum(
+                        fbmc_params["ptdf_zonal"][(timestamp, cnec, zone)]
+                        * model.fb_cnec_shadow[timestamp, cnec]
+                        for cnec in model.cnecs
+                    )
+                )
+
+    model.objective = pyo.Objective(expr=0.0, sense=pyo.minimize)
+
+    return model
+
+
+def solve_master_with_price_cuts(
+    master_model: pyo.ConcreteModel,
+    orders: Orderbook,
+    market_products: list[MarketProduct],
+    market_zone_ids: list[str],
+    fbmc_params: dict | None,
+    ntc_params: dict | None,
+    price_floor: float,
+    price_cap: float,
+    solver: OptSolver,
+    solver_options: dict,
+):
+    """Find a welfare-optimal and price-feasible block selection."""
+    cuts_added = 0
+
+    while True:
+        try:
+            results = solver.solve(master_model, options=solver_options)
+        except Exception as exc:
+            raise Exception(f"Market-clearing problem failed: {exc}") from exc
+
+        if _result_is_infeasible(results):
+            if cuts_added:
+                raise Exception(
+                    "No price-feasible discrete market-clearing solution exists."
+                )
+            raise Exception("Market-clearing problem is infeasible.")
+
+        if not _result_has_solution(results):
+            raise Exception(
+                "Market-clearing problem did not produce a feasible solution "
+                f"({results.solver.termination_condition})."
+            )
+
+        master_solution = _collect_master_solution(master_model)
+
+        price_model = build_price_feasibility_model(
+            orders=orders,
+            market_products=market_products,
+            market_zone_ids=market_zone_ids,
+            fbmc_params=fbmc_params,
+            ntc_params=ntc_params,
+            master_solution=master_solution,
+            price_floor=price_floor,
+            price_cap=price_cap,
+        )
+
+        try:
+            price_results = solver.solve(
+                price_model,
+                options=solver_options,
+            )
+        except Exception as exc:
+            raise Exception(
+                f"Price-feasibility subproblem failed: {exc}"
+            ) from exc
+
+        if _result_has_solution(price_results):
+            return master_model, master_solution
+
+        if not _result_is_infeasible(price_results):
+            raise Exception(
+                "Price-feasibility subproblem did not produce a valid result "
+                f"({price_results.solver.termination_condition})."
+            )
+
+        if not list(master_model.bBids):
+            raise Exception(
+                "No price-feasible market-clearing solution exists."
+            )
+
+        accepted_ids = [
+            bid_id
+            for bid_id in master_model.bBids
+            if master_solution["selected_x"][bid_id] == 1
+        ]
+        rejected_ids = [
+            bid_id
+            for bid_id in master_model.bBids
+            if master_solution["selected_x"][bid_id] == 0
+        ]
+
+        master_model.price_feasibility_cuts.add(
+            sum(1 - master_model.x[bid_id] for bid_id in accepted_ids)
+            + sum(master_model.x[bid_id] for bid_id in rejected_ids)
+            >= 1
+        )
+        cuts_added += 1 # TODO Check cut logic
+
+
+def find_price_bounds(
+    orders: Orderbook,
+    market_products: list[MarketProduct],
+    market_zone_ids: list[str],
+    fbmc_params: dict | None,
+    ntc_params: dict | None,
+    master_solution: dict,
+    price_floor: float,
+    price_cap: float,
+    solver: OptSolver,
+    solver_options: dict,
+):
+    """Find feasible lower and upper prices for each zone and timestamp."""
+    lower_price = {}
+    upper_price = {}
+
+    for timestamp in [product[0] for product in market_products]:
+        for zone in market_zone_ids:
+            lower_model = build_price_feasibility_model(
+                orders=orders,
+                market_products=market_products,
+                market_zone_ids=market_zone_ids,
+                fbmc_params=fbmc_params,
+                ntc_params=ntc_params,
+                master_solution=master_solution,
+                price_floor=price_floor,
+                price_cap=price_cap,
+            )
+            lower_model.objective.deactivate()
+            lower_model.price_bound_objective = pyo.Objective(
+                expr=lower_model.price[timestamp, zone],
+                sense=pyo.minimize,
+            )
+            _solve_checked(
+                solver=solver,
+                model=lower_model,
+                solver_options=solver_options,
+                context="Lower-price subproblem",
+            )
+            lower_price[(timestamp, zone)] = float(
+                pyo.value(lower_model.price[timestamp, zone])
+            )
+
+            upper_model = build_price_feasibility_model(
+                orders=orders,
+                market_products=market_products,
+                market_zone_ids=market_zone_ids,
+                fbmc_params=fbmc_params,
+                ntc_params=ntc_params,
+                master_solution=master_solution,
+                price_floor=price_floor,
+                price_cap=price_cap,
+            )
+            upper_model.objective.deactivate()
+            upper_model.price_bound_objective = pyo.Objective(
+                expr=upper_model.price[timestamp, zone],
+                sense=pyo.maximize,
+            )
+            _solve_checked(
+                solver=solver,
+                model=upper_model,
+                solver_options=solver_options,
+                context="Upper-price subproblem",
+            )
+            upper_price[(timestamp, zone)] = float(
+                pyo.value(upper_model.price[timestamp, zone])
+            )
+
+            # TODO Check if needed
+            logger.debug(
+                "Price bounds at %s in %s: lower=%s, upper=%s, midpoint=%s",
+                timestamp,
+                zone,
+                lower_price[(timestamp, zone)],
+                upper_price[(timestamp, zone)],
+                0.5 * (
+                    lower_price[(timestamp, zone)]
+                    + upper_price[(timestamp, zone)]
+                ),
+            )    
+
+    return lower_price, upper_price
+
+
+def select_midpoint_prices(
+    orders: Orderbook,
+    market_products: list[MarketProduct],
+    market_zone_ids: list[str],
+    fbmc_params: dict | None,
+    ntc_params: dict | None,
+    master_solution: dict,
+    price_floor: float,
+    price_cap: float,
+    solver: OptSolver,
+    solver_options: dict,
+):
+    """Select deterministic feasible prices nearest to interval midpoints."""
+    lower_price, upper_price = find_price_bounds(
+        orders=orders,
+        market_products=market_products,
+        market_zone_ids=market_zone_ids,
+        fbmc_params=fbmc_params,
+        ntc_params=ntc_params,
+        master_solution=master_solution,
+        price_floor=price_floor,
+        price_cap=price_cap,
+        solver=solver,
+        solver_options=solver_options,
+    )
+    midpoint = {
+        key: 0.5 * (lower_price[key] + upper_price[key])
+        for key in lower_price
+    }
+
+    price_model = build_price_feasibility_model(
+        orders=orders,
+        market_products=market_products,
+        market_zone_ids=market_zone_ids,
+        fbmc_params=fbmc_params,
+        ntc_params=ntc_params,
+        master_solution=master_solution,
+        price_floor=price_floor,
+        price_cap=price_cap,
+    )
+    price_model.objective.deactivate()
+    price_model.midpoint_objective = pyo.Objective(
+        expr=sum(
+            (
+                price_model.price[timestamp, zone]
+                - midpoint[(timestamp, zone)]
+            )
+            ** 2
+            for timestamp in price_model.T
+            for zone in price_model.zones
+        ),
+        sense=pyo.minimize,
+    )
+
+    quadratic_solution_found = False
+
+    try:
+        results = solver.solve(price_model, options=solver_options)
+        quadratic_solution_found = _result_has_solution(results)
+    except Exception:
+        quadratic_solution_found = False
+
+    if not quadratic_solution_found:
+        price_model = build_price_feasibility_model(
+            orders=orders,
+            market_products=market_products,
+            market_zone_ids=market_zone_ids,
+            fbmc_params=fbmc_params,
+            ntc_params=ntc_params,
+            master_solution=master_solution,
+            price_floor=price_floor,
+            price_cap=price_cap,
+        )
+        price_model.objective.deactivate()
+        price_model.abs_deviation = pyo.Var(
+            price_model.T,
+            price_model.zones,
+            domain=pyo.NonNegativeReals,
+        )
+        price_model.abs_deviation_constraints = pyo.ConstraintList()
+
+        for timestamp in price_model.T:
+            for zone in price_model.zones:
+                price_model.abs_deviation_constraints.add(
+                    price_model.abs_deviation[timestamp, zone]
+                    >= price_model.price[timestamp, zone]
+                    - midpoint[(timestamp, zone)]
+                )
+                price_model.abs_deviation_constraints.add(
+                    price_model.abs_deviation[timestamp, zone]
+                    >= midpoint[(timestamp, zone)]
+                    - price_model.price[timestamp, zone]
+                )
+
+        price_model.midpoint_objective = pyo.Objective(
+            expr=sum(
+                price_model.abs_deviation[timestamp, zone]
+                for timestamp in price_model.T
+                for zone in price_model.zones
+            ),
+            sense=pyo.minimize,
+        )
+        _solve_checked(
+            solver=solver,
+            model=price_model,
+            solver_options=solver_options,
+            context="Deterministic LP price-selection subproblem",
+        )
+
+    return {
+        zone: {
+            timestamp: float(pyo.value(price_model.price[timestamp, zone]))
+            for timestamp in price_model.T
+        }
+        for zone in price_model.zones
+    }
+
+
+def _replace_objective(
+    model: pyo.ConcreteModel,
+    name: str,
+    expression,
+    sense,
+):
+    """Deactivate active objectives and add one replacement objective."""
+    for objective in model.component_objects(pyo.Objective, active=True):
+        objective.deactivate()
+
+    setattr(
+        model,
+        name,
+        pyo.Objective(expr=expression, sense=sense),
+    )
+
+
+def solve_volume_flow_tiebreak(
+    orders: Orderbook,
+    market_products: list[MarketProduct],
+    with_linked_bids: bool,
+    with_exclusive_groups: bool,
+    market_zone_ids: list[str],
+    fbmc_params: dict | None,
+    ntc_params: dict | None,
+    master_solution: dict,
+    master_welfare: float,
+    market_clearing_prices: dict,
+    price_floor: float,
+    price_cap: float,
+    solver: OptSolver,
+    solver_options: dict,
+):
+    """
+    Resolve remaining simple-bid volume indeterminacy deterministically.
+
+    Block statuses, block ratios, NTC flows, and FB net exports are fixed
+    to the values used by price feasibility. This is necessary because price
+    conditions are valid only for the fixed network state used by the price
+    subproblem.
+
+    Therefore, the previous NTC minimum-norm flow stage is deliberately not
+    run after prices have been selected: changing an NTC flow could change
+    whether a capacity is binding and invalidate the selected prices.
+    """
+    model = build_market_clearing_model(
+        orders=orders,
+        market_products=market_products,
+        with_linked_bids=with_linked_bids,
+        with_exclusive_groups=with_exclusive_groups,
+        market_zone_ids=market_zone_ids,
+        fbmc_params=fbmc_params,
+        ntc_params=ntc_params,
+    )
+    model.objective.deactivate()
+
+    for bid_id in model.bBids:
+        model.x[bid_id].fix(master_solution["selected_x"][bid_id])
+        model.xb[bid_id].fix(master_solution["block_acceptance"][bid_id])
+
+    # Keep the NTC flow state used by the NTC price-feasibility rules.
+    if hasattr(model, "ntc_flow"):
+        for timestamp in model.T:
+            for line_id in model.ntc_lines:
+                model.ntc_flow[timestamp, line_id].fix(
+                    master_solution["ntc_flow"][(timestamp, line_id)]
+                )
+
+    # Keep the FB net-export state used to determine binding CNECs and
+    # therefore FB congestion-price feasibility.
+    if hasattr(model, "net_export_fb"):
+        for timestamp in model.T:
+            for zone in model.fbmc_zones:
+                model.net_export_fb[timestamp, zone].fix(
+                    master_solution["fb_net_export"][(timestamp, zone)]
+                )
+
+    model.simple_price_consistency = pyo.ConstraintList()
+    price_taking_terms = []
+    at_money_terms = []
+
+    for order in orders:
+        if order["bid_type"] != "SB":
+            continue
+
+        bid_id = order["bid_id"]
+        bid_price = order["price"]
+        volume = order["volume"]
+        final_price = market_clearing_prices[order["node"]][
+            order["start_time"]
+        ]
+
+        if volume > 0:
+            if final_price > bid_price + EPS:
+                model.simple_price_consistency.add(model.xs[bid_id] == 1.0)
+            elif final_price < bid_price - EPS:
+                model.simple_price_consistency.add(model.xs[bid_id] == 0.0)
+
+            if abs(bid_price - price_floor) <= EPS:
+                price_taking_terms.append(
+                    abs(volume) * (1.0 - model.xs[bid_id])
+                )
+
+        elif volume < 0:
+            if final_price < bid_price - EPS:
+                model.simple_price_consistency.add(model.xs[bid_id] == 1.0)
+            elif final_price > bid_price + EPS:
+                model.simple_price_consistency.add(model.xs[bid_id] == 0.0)
+
+            if abs(bid_price - price_cap) <= EPS:
+                price_taking_terms.append(
+                    abs(volume) * (1.0 - model.xs[bid_id])
+                )
+
+        if abs(bid_price - final_price) <= EPS:
+            at_money_terms.append(abs(volume) * model.xs[bid_id])
+
+    # Re-establish welfare-maximising simple-bid volumes under:
+    #
+    # - fixed block activations and ratios;
+    # - fixed NTC flows;
+    # - fixed FB net exports;
+    # - fixed final prices;
+    # - official simple-order acceptance rules.
+    _replace_objective(
+        model=model,
+        name="price_consistent_welfare_objective",
+        expression=model.welfare,
+        sense=pyo.maximize,
+    )
+    _solve_checked(
+        solver=solver,
+        model=model,
+        solver_options=solver_options,
+        context="Price-consistent welfare tie-break",
+    )
+
+    price_consistent_welfare = float(pyo.value(model.welfare))
+    welfare_tolerance = max(
+        EPS,
+        1e-6,
+        abs(master_welfare) * 1e-7,
+    )
+
+    if price_consistent_welfare < master_welfare - welfare_tolerance:
+        raise Exception(
+            "Selected prices are not compatible with the welfare-optimal "
+            "master dispatch."
+        )
+
+    model.primary_welfare_lower = pyo.Constraint(
+        expr=model.welfare >= price_consistent_welfare - welfare_tolerance
+    )
+    model.primary_welfare_upper = pyo.Constraint(
+        expr=model.welfare <= price_consistent_welfare + welfare_tolerance
+    )
+
+    # Stage 5a: minimise rejected price-taking simple-order volume.
+    model.curtailment = pyo.Expression(expr=sum(price_taking_terms))
+    _replace_objective(
+        model=model,
+        name="curtailment_objective",
+        expression=model.curtailment,
+        sense=pyo.minimize,
+    )
+    _solve_checked(
+        solver=solver,
+        model=model,
+        solver_options=solver_options,
+        context="Price-taking curtailment tie-break",
+    )
+
+    curtailment_optimum = float(pyo.value(model.curtailment))
+    model.curtailment_fix = pyo.Constraint(
+        expr=model.curtailment <= curtailment_optimum + EPS
+    )
+
+    # Stage 5b: maximise accepted at-the-money simple-bid volume.
+    model.at_money_volume = pyo.Expression(expr=sum(at_money_terms))
+    _replace_objective(
+        model=model,
+        name="at_money_volume_objective",
+        expression=model.at_money_volume,
+        sense=pyo.maximize,
+    )
+    _solve_checked(
+        solver=solver,
+        model=model,
+        solver_options=solver_options,
+        context="At-the-money volume tie-break",
+    )
+
+    at_money_optimum = float(pyo.value(model.at_money_volume))
+    model.at_money_volume_fix = pyo.Constraint(
+        expr=model.at_money_volume >= at_money_optimum - EPS
+    )
+
+    # NTC flows and FB net exports intentionally remain fixed. See docstring.
+    return model
 
 
 class ComplexClearingRole(MarketRole):
-    """
-    This class defines an optimization-based market clearing algorithm with support for complex bid types,
-    including block bids, linked bids, exclusive groups of block bids, minimum acceptance ratios, and profiled
-    volumes. It supports network representations (through Net Transfer Capacities) with either zonal or nodal
-    configurations, enabling the modeling of complex markets with multiple zones based on a transport model.
-
-    The market clearing algorithm accepts additional arguments via the ``param_dict`` in the market configuration.
-
-    Args:
-        marketconfig (MarketConfig): The market configuration object containing all parameters for the market clearing process.
-
-    Attributes:
-        marketconfig (MarketConfig): The market configuration.
-        incidence_matrix (pd.DataFrame): The directed incidence matrix representing the power network connections (definition according to Wikipedia https://en.wikipedia.org/wiki/Incidence_matrix)
-        nodes (list): List of nodes or zones in the network, depending on the selected representation.
-
-    Supported Parameters in ``param_dict``:
-        - ``solver_name`` (str): Specifies the solver_name to be used for the optimization problem. Default is `'appsi_highs'`.
-        - ``log_flows`` (bool): Indicates whether to log the power flows on the lines. Default is `False`.
-        - ``pricing_mechanism`` (str): Defines the pricing mechanism to be used. Default is `'pay_as_clear'`, with an alternative option of `'pay_as_bid'`.
-        - ``zones_identifier`` (str): The key in the bus data that identifies the zone each bus belongs to. Used for zonal representation.
-
-    Supported Additional Fields:
-        - ``min_acceptance_ratio`` (float): Activates the minimum acceptance ratio mode.
-        - ``parent_bid_id`` (str): Activates linked bids.
-        - ``exclusive_group_id``: Activates exclusive groups. Only evaluated for block bids ('BB', 'LB').
-          At most one block bid per group can be accepted.
-
-    Example market configuration:
-
-    .. code-block:: yaml
-
-        market_mechanism: complex_clearing
-        additional_fields:
-            - min_acceptance_ratio
-            - parent_bid_id
-            - exclusive_group_id
-        param_dict:
-            solver_name: appsi_highs
-            log_flows: true
-            pricing_mechanism: pay_as_clear
-            zones_identifier: zone_id
-
-    Network Representations:
-        - **Zonal Representation**: The network is divided into zones, and the incidence matrix represents the connections between these zones.
-            - If a ``zones_identifier`` is provided, buses are grouped into zones based on this identifier.
-            - The incidence matrix is constructed to represent the power connections between these zones.
-            - The total transfer capacity between zones is determined by the sum of the capacities of the lines connecting the zones.
-            - The line type can be either set to "ATC" (default) or FBMC (currently only a placeholder).
-            - For ATC lines losses, tariffs and ramping constraints can be added.
-
-        - **Nodal Representation**: If no ``zones_identifier`` is provided, each bus is treated as a separate node, and the incidence matrix represents the connections between these nodes.
-    """
+    """EUPHEMIA-like market clearing with NTC, FBMC, or hybrid coupling."""
 
     def __init__(self, marketconfig: MarketConfig):
         super().__init__(marketconfig)
+
         self.solver_name = get_supported_solver_pyomo(
             marketconfig.param_dict.get("solver_name", "appsi_highs")
         )
         self.solver = SolverFactory(self.solver_name)
         self.solver_options = {}
+
         if self.solver_name == "gurobi":
             self.solver_options = {
                 "cutoff": -1.0,
                 "MIPGap": EPS,
             }
 
-        # Define grid data
-        self.nodes = ["node0"]
-        self.zones_id = None
-        self.incidence_matrix = None
-        self.lines = None
-        self.line_methods = {}
-        self.line_losses = {}
-        self.line_tariffs = {}
-        self.line_ramping = {}
-
-        if self.grid_data:
-            self.lines = self.grid_data["lines"]
-            buses = self.grid_data["buses"]
-
-            if "x" in self.lines.columns:
-                logger.warning(
-                    "Warning: 'lines.csv' contains reactances 'x' but this clearing is based on Net Transfer Capacities only (Transport model). Use 'nodal_clearing' to include a linear OPF."
-                )
-
-             # Extract capacity calculation method per line (ATC or FBMC)
-            if "capacity_method" in self.lines.columns:
-                self.line_methods = self.lines["capacity_method"].to_dict()
-            else:
-                # Default to ATC if not specified
-                self.line_methods = {line_id: "ATC" for line_id in self.lines.index}
-                logger.info("No 'capacity_method' column found in lines. Defaulting all lines to ATC.")
-
-            # Extrace losses per line (as percentage)
-            if "losses" in self.lines.columns:
-                self.line_losses = {
-                    line_id: (0.0 if pd.isna(val) else float(val))
-                    for line_id, val in self.lines["losses"].items()
-                }
-            # Extract tariffs per line (€/MWh)
-            if "tariff" in self.lines.columns:
-                self.line_tariffs = {
-                    line_id: (0.0 if pd.isna(val) else float(val))
-                    for line_id, val in self.lines["tariff"].items()
-                }
-            # Extract ramoping limits per line (MW/h)
-            if "ramping_limit" in self.lines.columns:
-                self.line_ramping = {
-                    line_id: (None if pd.isna(val) else float(val))
-                    for line_id, val in self.lines["ramping_limit"].items()
-                }
-            else:
-                self.line_ramping = {line_id: None for line_id in self.lines.index}
-
-            self.zones_id = self.marketconfig.param_dict.get("zones_identifier")
-            self.node_to_zone = None
-
-            # Generate the incidence matrix and set the nodes based on zones or individual buses
-            if self.zones_id:
-                # Zonal Case
-                self.incidence_matrix = create_incidence_matrix(
-                    self.lines, buses, zones_id=self.zones_id
-                )
-                self.nodes = buses[self.zones_id].unique()
-                self.node_to_zone = buses[self.zones_id].to_dict()
-            else:
-                # Nodal Case
-                self.incidence_matrix = create_incidence_matrix(self.lines, buses)
-                self.nodes = buses.index.values
-
-        self.log_flows = self.marketconfig.param_dict.get("log_flows", False)
+        self.log_flows = self.marketconfig.param_dict.get(
+            "log_flows",
+            False,
+        )
         self.pricing_mechanism = self.marketconfig.param_dict.get(
-            "pricing_mechanism", "pay_as_clear"
+            "pricing_mechanism",
+            "pay_as_clear",
+        )
+        self.zone_column = self.marketconfig.param_dict.get(
+            "zones_identifier",
+            "zone_id",
+        )
+        self.network: pypsa.Network | None = self.marketconfig.param_dict.get(
+            "network"
+        )
+        self.flowbased_region = list(
+            self.marketconfig.param_dict.get("flowbased_region", [])
+        )
+        self.ntc_connections = self.marketconfig.param_dict.get(
+            "ntc_connections"
         )
 
+        self.market_zone_ids: list[str] = []
+        self.node_to_zone: dict = {}
+
+        if self.network is not None:
+            if self.zone_column not in self.network.buses.columns:
+                raise ValueError(
+                    f"The PyPSA network does not contain zone column "
+                    f"'{self.zone_column}'."
+                )
+
+            self.market_zone_ids = list(
+                pd.Index(self.network.buses[self.zone_column].unique())
+            )
+            self.node_to_zone = self.network.buses[self.zone_column].to_dict()
+
+        if self.flowbased_region and self.network is None:
+            raise ValueError(
+                "A pypsa.Network is required when flowbased_region is non-empty."
+            )
+
+        if self.flowbased_region:
+            unknown_zones = set(self.flowbased_region).difference(
+                self.market_zone_ids
+            )
+
+            if unknown_zones:
+                raise ValueError(
+                    "flowbased_region contains zones not present in "
+                    f"network.buses['{self.zone_column}']: "
+                    f"{sorted(unknown_zones)}"
+                )
+
+        self.line_results = []
+        self.all_orders = []
+
+    def _validate_market_product_snapshots(
+        self,
+        market_products: list[MarketProduct],
+    ) -> pd.Index:
+        """Validate market-product timestamps."""
+        snapshots = pd.Index(
+            [market_product[0] for market_product in market_products]
+        )
+
+        if snapshots.has_duplicates:
+            raise ValueError(
+                "Market products contain duplicate start timestamps. "
+                "This clearing implementation expects one product per "
+                "timestamp."
+            )
+
+        if self.network is not None:
+            network_snapshots = pd.Index(self.network.snapshots)
+            missing_snapshots = snapshots.difference(network_snapshots)
+
+            if not missing_snapshots.empty:
+                raise ValueError(
+                    "All market-product start times must be contained in "
+                    "network.snapshots. Missing timestamps: "
+                    f"{list(missing_snapshots)}"
+                )
+
+        return snapshots
+
+    def _determine_market_zones(
+        self,
+        orderbook: Orderbook,
+        ntc_params: dict,
+    ) -> list[str]:
+        """Determine all market zones used by the clearing."""
+        zones = list(self.market_zone_ids)
+
+        for zone in ntc_params["zone_ids"]:
+            if zone not in zones:
+                zones.append(zone)
+
+        for order in orderbook:
+            zone = order.get("node")
+
+            if zone is not None and zone not in zones:
+                zones.append(zone)
+
+        if not zones:
+            zones = ["node0"]
+
+        return zones
+
     def validate_orderbook(
-        self, orderbook: Orderbook, agent_addr: AgentAddress
+        self,
+        orderbook: Orderbook,
+        agent_addr: AgentAddress,
     ) -> None:
-        """
-        Checks whether the bid types are valid and whether the volumes are within the maximum bid volume.
-        Additionally, exclusive group ids are validated and only kept for block bids.
-
-        Args:
-            orderbook (Orderbook): The orderbook to be validated.
-            agent_addr (AgentAddress): The agent address of the market.
-
-        Raises:
-            ValueError: If the bid type is invalid.
-        """
+        """Validate order types, volumes, exclusive groups, and zones."""
         market_id = self.marketconfig.market_id
         max_volume = self.marketconfig.maximum_bid_volume
 
@@ -692,279 +1446,233 @@ class ComplexClearingRole(MarketRole):
         )
 
         for order in orderbook:
-            # if bid_type is None, set to default bid_type
             if order.get("bid_type") is None:
                 order["bid_type"] = "SB"
-            # Validate bid_type
             elif order["bid_type"] not in ["SB", "BB", "LB"]:
                 logger.warning(
-                    f"Market '{market_id}': Invalid bid_type '{order['bid_type']}' in order {order}. Setting to 'SB'."
+                    "Market '%s': invalid bid_type '%s' in order '%s'. "
+                    "Using SB.",
+                    market_id,
+                    order["bid_type"],
+                    order.get("bid_id"),
                 )
-                order["bid_type"] = "SB"  # Set to default bid_type
+                order["bid_type"] = "SB"
 
         super().validate_orderbook(orderbook, agent_addr)
 
         for order in orderbook:
-            # Validate volumes
             if order["bid_type"] in ["BB", "LB"]:
-                for key, volume in order.get("volume", {}).items():
+                for timestamp, volume in order.get("volume", {}).items():
                     if abs(volume) > max_volume:
                         logger.warning(
-                            f"Market '{market_id}': Volume '{volume}' for key '{key}' exceeds max_volume {max_volume} in order {order}. Setting to max_volume."
+                            "Market '%s': volume '%s' at '%s' exceeds "
+                            "maximum_bid_volume '%s'. Clipping it.",
+                            market_id,
+                            volume,
+                            timestamp,
+                            max_volume,
                         )
-                        order["volume"][key] = max_volume if volume > 0 else -max_volume
+                        order["volume"][timestamp] = (
+                            max_volume if volume > 0 else -max_volume
+                        )
 
-            # Exclusive group validation, only block bids can be part of a group
             if with_exclusive_groups:
                 if order.get("exclusive_group_id") is None:
                     order["exclusive_group_id"] = None
                 elif order["bid_type"] == "SB":
                     logger.warning(
-                        f"Market '{market_id}': Exclusive groups are only supported for block bids, "
-                        f"but order {order['bid_id']} is of bid_type 'SB'. Ignoring 'exclusive_group_id'."
+                        "Market '%s': simple order '%s' cannot belong to "
+                        "an exclusive group. Removing exclusive_group_id.",
+                        market_id,
+                        order["bid_id"],
                     )
                     order["exclusive_group_id"] = None
 
-            # Node validation
             node = order.get("node")
-            if node:
-                if self.zones_id:
-                    node = self.node_to_zone.get(node, self.nodes[0])
-                    order["node"] = node
-                if node not in self.nodes:
-                    logger.warning(
-                        f"Market '{market_id}': Node '{node}' not in nodes list {self.nodes}. Setting to first node '{self.nodes[0]}'. Order details: {order}"
-                    )
-                    order["node"] = self.nodes[0]
-            else:
-                if self.incidence_matrix is not None:
-                    logger.warning(
-                        f"Market '{market_id}': Order without a node, setting node to the first node '{self.nodes[0]}'. Please check the bidding strategy if correct node is set. Order details: {order}"
-                    )
-                    order["node"] = self.nodes[0]
-                else:
-                    logger.warning(
-                        f"Market '{market_id}': Order without a node and no incidence matrix, setting node to 'node0'. Order details: {order}"
-                    )
-                    order["node"] = "node0"
+
+            if node is None:
+                order["node"] = (
+                    self.market_zone_ids[0]
+                    if self.market_zone_ids
+                    else "node0"
+                )
+                logger.warning(
+                    "Market '%s': order '%s' has no node. Assigned '%s'.",
+                    market_id,
+                    order["bid_id"],
+                    order["node"],
+                )
+                continue
+
+            if node in self.node_to_zone:
+                order["node"] = self.node_to_zone[node]
 
     def clear(
-        self, orderbook: Orderbook, market_products
-    ) -> tuple[Orderbook, Orderbook, list[dict]]:
-        """
-        Implements pay-as-clear with more complex bid structures, including acceptance ratios, bid types, and profiled volumes.
-
-        Args:
-            orderbook (Orderbook): The orderbook to be cleared.
-            market_products (list[MarketProduct]): The products to be traded.
-
-        Raises:
-            Exception: If the problem is infeasible.
-
-        Returns:
-            accepted_orders (Orderbook): The accepted orders.
-            rejected_orders (Orderbook): The rejected orders.
-            meta (list[dict]): The market clearing results.
-            flows (dict): The power flows on the lines.
-
-        Note:
-            First the market clearing is solved using the cost minimization with the pyomo model market_clearing_opt.
-            Then the market clearing prices are extracted from the solved model as dual variables of the energy balance constraint.
-            Next the surplus of each order and its children is calculated and orders with negative surplus are removed from the orderbook.
-            This is repeated until all orders remaining in the orderbook have positive surplus.
-            Optional additional fields are: min_acceptance_ratio, parent_bid_id, exclusive_group_id, node
-        """
-
+        self,
+        orderbook: Orderbook,
+        market_products,
+    ) -> tuple[Orderbook, Orderbook, list[dict], dict]:
+        """Clear the market through master, price, and tie-break stages."""
         if len(orderbook) == 0:
-            return [], [], []
+            return [], [], [], {}
 
-        orderbook.sort(key=itemgetter("start_time", "end_time", "only_hours"))
+        orderbook.sort(
+            key=itemgetter("start_time", "end_time", "only_hours")
+        )
 
-        # create a list of all orders linked as child to a bid
+        snapshots = self._validate_market_product_snapshots(
+            market_products
+        )
+
+        fbmc_params = None
+        raw_fbmc_parameters = None
+
+        if self.flowbased_region:
+            logger.info(
+                "Precomputing FBMC parameters for region %s.",
+                self.flowbased_region,
+            )
+            raw_fbmc_parameters = precompute_fbmc_parameters(
+                network=self.network,
+                flowbased_region=self.flowbased_region,
+                zone_column=self.zone_column,
+                snapshots=snapshots,
+                solver_name=self.marketconfig.param_dict.get(
+                    "fbmc_solver_name"
+                ),
+            )
+            fbmc_params = to_clearing_input(raw_fbmc_parameters)
+
+        ntc_params = load_ntc_connections(
+            ntc_connections=self.ntc_connections,
+            snapshots=snapshots,
+        )
+        market_zone_ids = self._determine_market_zones(
+            orderbook=orderbook,
+            ntc_params=ntc_params,
+        )
+
+        if fbmc_params is not None:
+            for zone in fbmc_params["fbmc_zone_ids"]:
+                if zone not in market_zone_ids:
+                    market_zone_ids.append(zone)
+
+        self.market_zone_ids = market_zone_ids
         child_orders = []
+
         for order in orderbook:
             order["accepted_price"] = {}
             order["accepted_volume"] = {}
-            # get child linked bids
-            if "parent_bid_id" in order.keys() and order["parent_bid_id"] is not None:
-                # check whether the parent bid is in the orderbook
-                parent_bid_id = order["parent_bid_id"]
-                parent_bid = next(
-                    (bid for bid in orderbook if bid["bid_id"] == parent_bid_id), None
-                )
-                if parent_bid is None:
-                    order["parent_bid_id"] = None
-                    logger.warning(f"Parent bid {parent_bid_id} not in orderbook")
-                else:
-                    child_orders.append(order)
 
-        with_linked_bids = bool(child_orders)
+            parent_bid_id = order.get("parent_bid_id")
 
-        # check whether exclusive groups of block bids are present in the orderbook
-        with_exclusive_groups = bool(get_exclusive_groups(orderbook))
+            if parent_bid_id is None:
+                continue
 
-        rejected_orders: Orderbook = []
-
-        mode = "default"
-        if "min_acceptance_ratio" in self.marketconfig.additional_fields:
-            mode = "with_min_acceptance_ratio"
-
-        # solve the market clearing problem
-        while True:
-            # solve the optimization with the current orderbook
-            instance, results = market_clearing_opt(
-                orders=orderbook,
-                market_products=market_products,
-                mode=mode,
-                with_linked_bids=with_linked_bids,
-                with_exclusive_groups=with_exclusive_groups,
-                incidence_matrix=self.incidence_matrix,
-                lines=self.lines,
-                line_methods=self.line_methods,
-                line_losses=self.line_losses,
-                line_tariffs=self.line_tariffs,
-                line_ramping = self.line_ramping,
-                solver=self.solver,
-                solver_options=self.solver_options,
+            parent_bid = next(
+                (
+                    bid
+                    for bid in orderbook
+                    if bid["bid_id"] == parent_bid_id
+                ),
+                None,
             )
 
-            if results.solver.termination_condition == TerminationCondition.infeasible:
-                raise Exception("infeasible")
-
-            # extract dual from model.energy_balance
-            market_clearing_prices = {}
-            for node in self.nodes:
-                market_clearing_prices[node] = {
-                    t: instance.dual[instance.energy_balance[node, t]]
-                    for t in instance.T
-                }
-
-            # check the surplus of each order and remove those with negative surplus
-            orders_surplus = []
-            for order in orderbook:
-                children = []
-                if with_linked_bids:
-                    children = [
-                        child
-                        for child in child_orders
-                        if child["parent_bid_id"] == order["bid_id"]
-                    ]
-
-                order_surplus = calculate_order_surplus(
-                    order, market_clearing_prices, instance, children
+            if parent_bid is None:
+                order["parent_bid_id"] = None
+                logger.warning(
+                    "Parent bid '%s' is not in the orderbook.",
+                    parent_bid_id,
                 )
+            else:
+                child_orders.append(order)
 
-                # correct rounding
-                if order_surplus != 0 and abs(order_surplus) < EPS:
-                    order_surplus = 0
+        with_linked_bids = bool(child_orders)
+        with_exclusive_groups = bool(get_exclusive_groups(orderbook))
 
-                orders_surplus.append(order_surplus)
+        price_floor = self.marketconfig.param_dict.get(
+            "price_floor",
+            -500.0,
+        )
+        price_cap = self.marketconfig.param_dict.get(
+            "price_cap",
+            4000.0,
+        )
 
-                # remove orders with negative profit
-                if order_surplus < 0:
-                    rejected_orders.append(order)
-                    orderbook.remove(order)
-                    rejected_orders.extend(children)
-                    for child in children:
-                        orderbook.remove(child)
-
-            # check if all orders have positive surplus
-            if all(order_surplus >= 0 for order_surplus in orders_surplus):
-                break
-
-        accepted_orders, rejected_orders, meta, flows, line_results = extract_results(
-            model=instance,
+        master_model = build_market_clearing_model(
             orders=orderbook,
-            rejected_orders=rejected_orders,
+            market_products=market_products,
+            with_linked_bids=with_linked_bids,
+            with_exclusive_groups=with_exclusive_groups,
+            market_zone_ids=market_zone_ids,
+            fbmc_params=fbmc_params,
+            ntc_params=ntc_params,
+        )
+        master_model, master_solution = solve_master_with_price_cuts(
+            master_model=master_model,
+            orders=orderbook,
+            market_products=market_products,
+            market_zone_ids=market_zone_ids,
+            fbmc_params=fbmc_params,
+            ntc_params=ntc_params,
+            price_floor=price_floor,
+            price_cap=price_cap,
+            solver=self.solver,
+            solver_options=self.solver_options,
+        )
+        master_welfare = float(pyo.value(master_model.welfare))
+
+        market_clearing_prices = select_midpoint_prices(
+            orders=orderbook,
+            market_products=market_products,
+            market_zone_ids=market_zone_ids,
+            fbmc_params=fbmc_params,
+            ntc_params=ntc_params,
+            master_solution=master_solution,
+            price_floor=price_floor,
+            price_cap=price_cap,
+            solver=self.solver,
+            solver_options=self.solver_options,
+        )
+
+        final_model = solve_volume_flow_tiebreak(
+            orders=orderbook,
+            market_products=market_products,
+            with_linked_bids=with_linked_bids,
+            with_exclusive_groups=with_exclusive_groups,
+            market_zone_ids=market_zone_ids,
+            fbmc_params=fbmc_params,
+            ntc_params=ntc_params,
+            master_solution=master_solution,
+            master_welfare=master_welfare,
+            market_clearing_prices=market_clearing_prices,
+            price_floor=price_floor,
+            price_cap=price_cap,
+            solver=self.solver,
+            solver_options=self.solver_options,
+        )
+
+        (
+            accepted_orders,
+            rejected_orders,
+            meta,
+            flows,
+            line_results,
+        ) = extract_results(
+            model=final_model,
+            orders=orderbook,
+            rejected_orders=[],
             market_products=market_products,
             market_clearing_prices=market_clearing_prices,
             pricing_mechanism=self.pricing_mechanism,
             log_flows=self.log_flows,
-            line_tariffs=self.line_tariffs,
-            line_losses=self.line_losses,
+            fbmc_parameters=raw_fbmc_parameters,
         )
 
         self.line_results = line_results
         self.all_orders = []
 
         return accepted_orders, rejected_orders, meta, flows
-
-
-def calculate_order_surplus(
-    order: dict,
-    market_clearing_prices: dict,
-    instance: pyo.ConcreteModel,
-    children: list[dict],
-):
-    """
-    Calculates the surplus of an order given the market clearing prices and results of the market clearing.
-
-    Args:
-        order (dict): The order
-        market_clearing_prices (dict): The market clearing prices.
-        instance (pyomo.core.base.PyomoModel.ConcreteModel): The solved pyomo model containing the results of the market clearing.
-        children (list[dict]): The linked child bids of the given order.
-
-    Returns:
-        float: The surplus of the order as (market_clearing_price - order_price) * order_volume * order_acceptance
-
-    Note:
-        The surplus of children linked to the given order is added if it is positive to account for the rule that children can 'save' their parent bid.
-    """
-
-    order_surplus = 0
-
-    # calculate the surplus of simple bids
-    if order["bid_type"] == "SB":
-        if (
-            pyo.value(instance.xs[order["bid_id"]]) < EPS
-            or abs(
-                market_clearing_prices[order["node"]][order["start_time"]]
-                - order["price"]
-            )
-            < EPS
-        ):
-            order_surplus = 0
-        else:
-            order_surplus = (
-                (
-                    market_clearing_prices[order["node"]][order["start_time"]]
-                    - order["price"]
-                )
-                * order["volume"]
-                * pyo.value(instance.xs[order["bid_id"]])
-            )
-    # calculate the surplus of block bidx
-    elif order["bid_type"] in ["BB", "LB"]:
-        bid_volume = sum(order["volume"].values())
-        if pyo.value(instance.xb[order["bid_id"]]) < EPS:
-            order_surplus = 0
-        else:
-            order_surplus = (
-                sum(
-                    market_clearing_prices[order["node"]][t] * v
-                    for t, v in order["volume"].items()
-                )
-                - order["price"] * bid_volume
-            ) * pyo.value(instance.xb[order["bid_id"]])
-
-        # add the surplus of child linked bids if it is positive
-        for child_order in children:
-            child_surplus = (
-                sum(
-                    market_clearing_prices[child_order["node"]][t] * v
-                    for t, v in child_order["volume"].items()
-                )
-                - child_order["price"] * sum(child_order["volume"].values()) #  TODO Check if this fix is correct, was '*bid_volume' before
-            ) * pyo.value(instance.xb[child_order["bid_id"]])
-            if child_surplus > 0:
-                order_surplus += child_surplus
-
-    # correct rounding
-    if order_surplus != 0 and abs(order_surplus) < EPS:
-        order_surplus = 0
-
-    return order_surplus
 
 
 def extract_results(
@@ -975,79 +1683,69 @@ def extract_results(
     market_clearing_prices: dict,
     pricing_mechanism: str = "pay_as_clear",
     log_flows: bool = False,
-    line_tariffs: dict = None,
-    line_losses: dict = None,
+    fbmc_parameters: dict | None = None,
 ):
-    """
-    Extracts the results of the market clearing from the solved pyomo model.
-
-    Args:
-        model (pyomo.core.base.PyomoModel.ConcreteModel): The solved pyomo model containing the results of the market clearing
-        orders (Orderbook): List of the orders
-        rejected_orders (Orderbook): List of the rejected orders
-        market_products (list[MarketProduct]): The products to be traded
-        market_clearing_prices (dict): The market clearing prices
-
-    Returns:
-        tuple[Orderbook, Orderbook, list[dict]]: The accepted orders, rejected orders, and meta information
-
-    """
+    """Extract accepted/rejected orders, prices, and optional flow results."""
     if pricing_mechanism not in ["pay_as_clear", "pay_as_bid"]:
-        raise ValueError(f"Invalid pricing mechanism {pricing_mechanism}")
+        raise ValueError(f"Invalid pricing mechanism '{pricing_mechanism}'.")
 
     accepted_orders: Orderbook = []
     meta = []
 
-    supply_volume_dict = {node: {t: 0.0 for t in model.T} for node in model.nodes}
-    demand_volume_dict = {node: {t: 0.0 for t in model.T} for node in model.nodes}
+    supply_volume_dict = {
+        zone: {timestamp: 0.0 for timestamp in model.T}
+        for zone in model.zones
+    }
+    demand_volume_dict = {
+        zone: {timestamp: 0.0 for timestamp in model.T}
+        for zone in model.zones
+    }
 
     for order in orders:
         if order["bid_type"] == "SB":
-            acceptance = model.xs[order["bid_id"]].value
-            acceptance = 0 if acceptance < EPS else acceptance
+            acceptance = pyo.value(model.xs[order["bid_id"]])
+            acceptance = 0.0 if acceptance < EPS else acceptance
 
-            # set the accepted volume and price for each simple bid
             order["accepted_volume"] = acceptance * order["volume"]
+
             if pricing_mechanism == "pay_as_clear":
-                order["accepted_price"] = market_clearing_prices[order["node"]][
-                    order["start_time"]
-                ]
-            elif pricing_mechanism == "pay_as_bid":
+                order["accepted_price"] = market_clearing_prices[
+                    order["node"]
+                ][order["start_time"]]
+            else:
                 order["accepted_price"] = order["price"]
 
-            # calculate the total cleared supply and demand volume
             if order["accepted_volume"] > 0:
-                supply_volume_dict[order["node"]][order["start_time"]] += order[
-                    "accepted_volume"
-                ]
+                supply_volume_dict[order["node"]][
+                    order["start_time"]
+                ] += order["accepted_volume"]
             else:
-                demand_volume_dict[order["node"]][order["start_time"]] += order[
-                    "accepted_volume"
-                ]
+                demand_volume_dict[order["node"]][
+                    order["start_time"]
+                ] += order["accepted_volume"]
 
         elif order["bid_type"] in ["BB", "LB"]:
-            acceptance = model.xb[order["bid_id"]].value
-            acceptance = 0 if acceptance < EPS else acceptance
+            acceptance = pyo.value(model.xb[order["bid_id"]])
+            acceptance = 0.0 if acceptance < EPS else acceptance
 
-            # set the accepted volume and price for each block bid
-            for start_time, volume in order["volume"].items():
-                order["accepted_volume"][start_time] = acceptance * volume
+            for timestamp, volume in order["volume"].items():
+                order["accepted_volume"][timestamp] = acceptance * volume
+
                 if pricing_mechanism == "pay_as_clear":
-                    order["accepted_price"][start_time] = market_clearing_prices[
-                        order["node"]
-                    ][start_time]
-                elif pricing_mechanism == "pay_as_bid":
-                    order["accepted_price"][start_time] = order["price"]
-
-                # calculate the total cleared supply and demand volume
-                if order["accepted_volume"][start_time] > 0:
-                    supply_volume_dict[order["node"]][start_time] += order[
-                        "accepted_volume"
-                    ][start_time]
+                    order["accepted_price"][timestamp] = (
+                        market_clearing_prices[order["node"]][timestamp]
+                    )
                 else:
-                    demand_volume_dict[order["node"]][start_time] += order[
-                        "accepted_volume"
-                    ][start_time]
+                    order["accepted_price"][timestamp] = order["price"]
+
+                if order["accepted_volume"][timestamp] > 0:
+                    supply_volume_dict[order["node"]][timestamp] += (
+                        order["accepted_volume"][timestamp]
+                    )
+                else:
+                    demand_volume_dict[order["node"]][timestamp] += (
+                        order["accepted_volume"][timestamp]
+                    )
 
         if acceptance > 0:
             accepted_orders.append(order)
@@ -1055,25 +1753,30 @@ def extract_results(
             rejected_orders.append(order)
 
     for order in rejected_orders:
-        # set the accepted volume and price for each rejected order to zero
         if order["bid_type"] == "SB":
-            order["accepted_volume"] = 0
-            order["accepted_price"] = 0
+            order["accepted_volume"] = 0.0
+            order["accepted_price"] = 0.0
 
         elif order["bid_type"] in ["BB", "LB"]:
-            order["accepted_volume"] = {t: 0 for t in order["volume"].keys()}
-            order["accepted_price"] = {t: 0 for t in order["volume"].keys()}
+            order["accepted_volume"] = {
+                timestamp: 0.0
+                for timestamp in order["volume"]
+            }
+            order["accepted_price"] = {
+                timestamp: 0.0
+                for timestamp in order["volume"]
+            }
 
-    # write the meta information for each hour of the clearing period
-    for node in market_clearing_prices.keys():
+    for zone in market_clearing_prices:
         for product in market_products:
-            t = product[0]
+            timestamp = product[0]
+            duration_hours = (
+                product[1] - product[0]
+            ) / timedelta(hours=1)
 
-            clear_price = market_clearing_prices[node][t]
-
-            supply_volume = supply_volume_dict[node][t]
-            demand_volume = demand_volume_dict[node][t]
-            duration_hours = (product[1] - product[0]) / timedelta(hours=1)
+            clear_price = market_clearing_prices[zone][timestamp]
+            supply_volume = supply_volume_dict[zone][timestamp]
+            demand_volume = demand_volume_dict[zone][timestamp]
 
             meta.append(
                 {
@@ -1084,51 +1787,130 @@ def extract_results(
                     "price": clear_price,
                     "max_price": clear_price,
                     "min_price": clear_price,
-                    "node": node,
+                    "zone": zone,
                     "product_start": product[0],
                     "product_end": product[1],
                     "only_hours": product[2],
                 }
             )
 
-    flows_filtered = {}
+    flows = {}
     line_results = []
 
-    if log_flows and hasattr(model, "flows"):
-        flows_filtered = {
-            index: flow.value
-            for index, flow in model.flows.items()
-            if not flow.stale
-        }
+    if log_flows:
+        ntc_flows = {}
+        fb_net_exports = {}
+        net_positions = {}
 
-        # per-line tariff and loss accounting
-        for (t, line), flow in flows_filtered.items():
-            tariff_rate = (line_tariffs or {}).get(line, 0.0)
-            gamma = (line_losses or {}).get(line, 0.0)
+        if hasattr(model, "ntc_flow"):
+            ntc_flows = {
+                (timestamp, line_id): pyo.value(
+                    model.ntc_flow[timestamp, line_id]
+                )
+                for timestamp in model.T
+                for line_id in model.ntc_lines
+            }
 
-            if line in getattr(model, "split_lines", []):
-                f_pos = pyo.value(model.flow_pos[t, line])
-                f_neg = pyo.value(model.flow_neg[t, line])
-            else:
-                f_pos = max(flow, 0.0)
-                f_neg = max(-flow, 0.0)
-
-            transported = f_pos + f_neg
-            tariff_cost = tariff_rate * transported
-            losses = gamma * transported
-
-            line_results.append(
+            line_results.extend(
                 {
-                    "time": t,
-                    "line": line,
+                    "time": timestamp,
+                    "line": line_id,
                     "flow": flow,
-                    "flow_pos": f_pos,
-                    "flow_neg": f_neg,
-                    "tariff_rate": tariff_rate,
-                    "tariff_cost": tariff_cost,
-                    "loss_rate": gamma,
-                    "losses": losses,
+                    "network_type": "NTC",
                 }
+                for (timestamp, line_id), flow in ntc_flows.items()
             )
 
-    return accepted_orders, rejected_orders, meta, flows_filtered, line_results
+        if hasattr(model, "net_export_fb"):
+            fb_net_exports = {
+                (timestamp, zone): pyo.value(
+                    model.net_export_fb[timestamp, zone]
+                )
+                for timestamp in model.T
+                for zone in model.fbmc_zones
+            }
+
+            line_results.extend(
+                {
+                    "time": timestamp,
+                    "line": zone,
+                    "flow": flow,
+                    "network_type": "FBMC_NET_EXPORT",
+                }
+                for (timestamp, zone), flow in fb_net_exports.items()
+            )
+
+        net_positions = {
+            (timestamp, zone): pyo.value(
+                model.net_position[timestamp, zone]
+            )
+            for timestamp in model.T
+            for zone in model.zones
+        }
+
+        cnec_diagnostics = []
+
+        if (
+            fbmc_parameters is not None
+            and hasattr(model, "net_export_fb")
+            and "cnec_info" in fbmc_parameters
+            and "zonal_ptdf" in fbmc_parameters
+            and "ram" in fbmc_parameters
+        ):
+            cnec_info = fbmc_parameters["cnec_info"]
+            fb_zones = list(fbmc_parameters["flowbased_region"])
+
+            for timestamp in model.T:
+                ptdf = fbmc_parameters["zonal_ptdf"][timestamp]
+                ram_values = fbmc_parameters["ram"].loc[timestamp]
+
+                for cnec in model.cnecs:
+                    fb_flow = sum(
+                        float(ptdf.at[cnec, zone])
+                        * pyo.value(
+                            model.net_export_fb[timestamp, zone]
+                        )
+                        for zone in fb_zones
+                    )
+                    ram = float(ram_values.at[cnec])
+                    slack = ram - fb_flow
+                    cnec_metadata = cnec_info.loc[cnec]
+
+                    cnec_diagnostics.append(
+                        {
+                            "time": timestamp,
+                            "line": cnec,
+                            "flow": fb_flow,
+                            "network_type": "FBMC_CNEC",
+                            "cnec": cnec,
+                            "cne": cnec_metadata["cne"],
+                            "contingency": cnec_metadata["contingency"],
+                            "direction": cnec_metadata["direction"],
+                            "ram": ram,
+                            "fb_flow": fb_flow,
+                            "slack": slack,
+                            "binding": abs(slack) <= EPS,
+                            "utilization": (
+                                fb_flow / ram
+                                if abs(ram) > EPS
+                                else None
+                            ),
+                        }
+                    )
+
+            line_results.extend(cnec_diagnostics)
+
+        flows = {
+            "ntc_flows": ntc_flows,
+            "fb_net_exports": fb_net_exports,
+            "net_positions": net_positions,
+            "cnec_diagnostics": cnec_diagnostics,
+        }
+
+    return (
+        accepted_orders,
+        rejected_orders,
+        meta,
+        flows,
+        line_results,
+    )
