@@ -5,6 +5,8 @@
 """
 EUPHEMIA-like market clearing with NTC, FBMC, and hybrid coupling.
 
+Only fixed 15-minute day-ahead market time units (MTUs) are supported.
+
 Simple bids are continuous period-order decisions:
 
 - in-the-money simple bids are fully accepted;
@@ -12,6 +14,18 @@ Simple bids are continuous period-order decisions:
 - at-the-money simple bids may be accepted, partially accepted, or rejected.
 
 Block bids retain binary activation and minimum-acceptance-ratio logic.
+
+Physical quantities remain in MW:
+
+- bid volumes;
+- accepted volumes;
+- net positions;
+- NTC flows and capacities;
+- FBMC PTDF/RAM constraints;
+- logged line flows.
+
+Prices remain in EUR/MWh. Welfare, block surplus, and reported energy use
+the fixed 0.25-hour MTU duration to convert MW to MWh.
 """
 
 import logging
@@ -19,6 +33,7 @@ from collections import defaultdict
 from datetime import timedelta
 from operator import itemgetter
 from pathlib import Path
+from time import perf_counter 
 
 import pandas as pd
 import pyomo.environ as pyo
@@ -26,7 +41,7 @@ import pypsa
 from mango import AgentAddress
 from pyomo.opt import OptSolver, SolverFactory
 
-from assume.common.fbmc_utils_version4 import (
+from assume.common.fbmc_utils import (
     precompute_fbmc_parameters,
     to_clearing_input,
 )
@@ -39,7 +54,90 @@ logging.getLogger("gurobipy").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-EPS = 1e-5 # TODO Decide on a good value
+def _log_stage_duration(
+    stage_name: str,
+    start_time: float,
+    enabled: bool,
+) -> None:
+    """Log elapsed wall-clock time for one clearing stage."""
+    if not enabled:
+        return
+
+    elapsed_seconds = perf_counter() - start_time
+
+    logger.info(
+        "EUPHEMIA timing | %-45s %.3f s",
+        stage_name,
+        elapsed_seconds,
+    )
+
+EPS = 1e-5  # TODO Decide on a good value
+
+MTU_DURATION = timedelta(minutes=15)
+MTU_DURATION_HOURS = 0.25
+
+
+def _validate_15_minute_market_products(
+    market_products: list[MarketProduct],
+) -> pd.Index:
+    """
+    Validate fixed 15-minute market products.
+
+    Every product must have exactly one 15-minute duration, unique product
+    start timestamps, and start timestamps aligned to 15-minute boundaries.
+    """
+    if not market_products:
+        raise ValueError("At least one 15-minute market product is required.")
+
+    starts = []
+
+    for product in market_products:
+        start_time = product[0]
+        end_time = product[1]
+
+        try:
+            duration = end_time - start_time
+        except TypeError as exc:
+            raise ValueError(
+                "Market products must contain valid start and end timestamps."
+            ) from exc
+
+        if duration != MTU_DURATION:
+            raise ValueError(
+                "Only 15-minute market products are supported. "
+                f"Product starting at '{start_time}' has duration "
+                f"'{duration}', expected '{MTU_DURATION}'."
+            )
+
+        timestamp = pd.Timestamp(start_time)
+
+        if pd.isna(timestamp):
+            raise ValueError("Market-product start timestamps must not be null.")
+
+        if (
+            timestamp.minute % 15 != 0
+            or timestamp.second != 0
+            or timestamp.microsecond != 0
+            or timestamp.nanosecond != 0
+        ):
+            raise ValueError(
+                "Market-product start timestamps must be aligned to "
+                "15-minute boundaries. "
+                f"Invalid timestamp: '{start_time}'."
+            )
+
+        starts.append(start_time)
+
+    snapshots = pd.Index(starts)
+
+    if snapshots.has_duplicates:
+        raise ValueError(
+            "Market products contain duplicate start timestamps. "
+            "This clearing implementation expects one 15-minute product "
+            "per timestamp."
+        )
+
+    return snapshots
 
 
 def get_exclusive_groups(orders: Orderbook) -> dict[object, list[str]]:
@@ -64,7 +162,7 @@ def load_ntc_connections(
     ntc_connections: str | Path | pd.DataFrame | None,
     snapshots: pd.Index,
 ) -> dict:
-    """Load and validate time-dependent NTC connection data."""
+    """Load and validate time-dependent NTC connection data in MW."""
     empty_result = {
         "line_ids": [],
         "zone_ids": [],
@@ -144,7 +242,7 @@ def load_ntc_connections(
             if key not in ntc_data.index:
                 raise ValueError(
                     f"NTC data has no capacity row for line '{line_id}' "
-                    f"at timestamp '{timestamp}'."
+                    f"at 15-minute timestamp '{timestamp}'."
                 )
 
             row = ntc_data.loc[key]
@@ -180,7 +278,7 @@ def _get_order_net_position_expression(
     zone: str,
     timestamp,
 ):
-    """Build accepted supply-minus-demand volume for one zone/time."""
+    """Build accepted supply-minus-demand volume for one zone/time in MW."""
     expression = 0.0
 
     for order in orders:
@@ -398,6 +496,12 @@ def _build_welfare_expression(
     model: pyo.ConcreteModel,
     orders: Orderbook,
 ):
+    """
+    Build welfare in EUR.
+
+    Prices are EUR/MWh and accepted volumes are MW. The fixed 15-minute MTU
+    duration converts MW to MWh using MTU_DURATION_HOURS.
+    """
     welfare = 0.0
 
     for order in orders:
@@ -405,12 +509,16 @@ def _build_welfare_expression(
             welfare += (
                 -order["price"]
                 * order["volume"]
+                * MTU_DURATION_HOURS
                 * model.xs[order["bid_id"]]
             )
 
         elif order["bid_type"] in ["BB", "LB"]:
             welfare += sum(
-                -order["price"] * volume * model.xb[order["bid_id"]]
+                -order["price"]
+                * volume
+                * MTU_DURATION_HOURS
+                * model.xb[order["bid_id"]]
                 for volume in order["volume"].values()
             )
 
@@ -599,6 +707,10 @@ def build_price_feasibility_model(
     - NTC flow/price complementarity conditions;
     - FBMC PTDF congestion-price conditions.
 
+    Block surplus is represented in EUR:
+
+        (market_price - bid_price) * volume_mw * 0.25 * acceptance
+
     FBMC price conditions are:
 
         price[t, z]
@@ -703,6 +815,7 @@ def build_price_feasibility_model(
                 - order["price"]
             )
             * volume
+            * MTU_DURATION_HOURS
             * acceptance
             for timestamp, volume in order["volume"].items()
         )
@@ -823,15 +936,27 @@ def solve_master_with_price_cuts(
     price_cap: float,
     solver: OptSolver,
     solver_options: dict,
+    timing_enabled: bool = False,
 ):
     """Find a welfare-optimal and price-feasible block selection."""
     cuts_added = 0
+    iteration = 0
 
     while True:
+        iteration += 1
+
+        master_solve_start = perf_counter()
+
         try:
             results = solver.solve(master_model, options=solver_options)
         except Exception as exc:
             raise Exception(f"Market-clearing problem failed: {exc}") from exc
+        finally:
+            _log_stage_duration(
+                stage_name=f"Master solve (iteration {iteration})",
+                start_time=master_solve_start,
+                enabled=timing_enabled,
+            )
 
         if _result_is_infeasible(results):
             if cuts_added:
@@ -859,6 +984,8 @@ def solve_master_with_price_cuts(
             price_cap=price_cap,
         )
 
+        price_feasibility_start = perf_counter()
+
         try:
             price_results = solver.solve(
                 price_model,
@@ -868,6 +995,15 @@ def solve_master_with_price_cuts(
             raise Exception(
                 f"Price-feasibility subproblem failed: {exc}"
             ) from exc
+        finally:
+            _log_stage_duration(
+                stage_name=(
+                    f"Price-feasibility solve within "
+                    f"solve_master_with_price_cuts (iteration {iteration})"
+                ),
+                start_time=price_feasibility_start,
+                enabled=timing_enabled,
+            )
 
         if _result_has_solution(price_results):
             return master_model, master_solution
@@ -901,6 +1037,48 @@ def solve_master_with_price_cuts(
         )
         cuts_added += 1 # TODO Check cut logic
 
+def _get_directly_fixed_prices(
+    orders: Orderbook,
+    master_solution: dict,
+) -> dict[tuple, float]:
+    """
+    Return price values directly fixed by partially accepted simple orders.
+
+    A partially accepted simple bid is at-the-money and therefore fixes the
+    market-clearing price of its zone and timestamp to its bid price.
+    """
+    fixed_prices = {}
+
+    for order in orders:
+        if order["bid_type"] != "SB":
+            continue
+
+        bid_id = order["bid_id"]
+        acceptance = master_solution["simple_acceptance"][bid_id]
+
+        if not EPS < acceptance < 1.0 - EPS:
+            continue
+
+        key = (
+            order["start_time"],
+            order["node"],
+        )
+        bid_price = float(order["price"])
+
+        existing_price = fixed_prices.get(key)
+
+        if (
+            existing_price is not None
+            and abs(existing_price - bid_price) > EPS
+        ):
+            raise ValueError(
+                "Inconsistent partially accepted simple bids at "
+                f"{key}: {existing_price} and {bid_price}."
+            )
+
+        fixed_prices[key] = bid_price
+
+    return fixed_prices
 
 def find_price_bounds(
     orders: Orderbook,
@@ -914,74 +1092,96 @@ def find_price_bounds(
     solver: OptSolver,
     solver_options: dict,
 ):
-    """Find feasible lower and upper prices for each zone and timestamp."""
+    """
+    Find exact feasible lower and upper prices.
+
+    Prices fixed by a partially accepted simple bid do not require LP solves.
+    All remaining prices are calculated using one reusable price model.
+    """
     lower_price = {}
     upper_price = {}
 
-    for timestamp in [product[0] for product in market_products]:
-        for zone in market_zone_ids:
-            lower_model = build_price_feasibility_model(
-                orders=orders,
-                market_products=market_products,
-                market_zone_ids=market_zone_ids,
-                fbmc_params=fbmc_params,
-                ntc_params=ntc_params,
-                master_solution=master_solution,
-                price_floor=price_floor,
-                price_cap=price_cap,
-            )
-            lower_model.objective.deactivate()
-            lower_model.price_bound_objective = pyo.Objective(
-                expr=lower_model.price[timestamp, zone],
-                sense=pyo.minimize,
-            )
-            _solve_checked(
-                solver=solver,
-                model=lower_model,
-                solver_options=solver_options,
-                context="Lower-price subproblem",
-            )
-            lower_price[(timestamp, zone)] = float(
-                pyo.value(lower_model.price[timestamp, zone])
-            )
+    fixed_prices = _get_directly_fixed_prices(
+        orders=orders,
+        master_solution=master_solution,
+    )
 
-            upper_model = build_price_feasibility_model(
-                orders=orders,
-                market_products=market_products,
-                market_zone_ids=market_zone_ids,
-                fbmc_params=fbmc_params,
-                ntc_params=ntc_params,
-                master_solution=master_solution,
-                price_floor=price_floor,
-                price_cap=price_cap,
-            )
-            upper_model.objective.deactivate()
-            upper_model.price_bound_objective = pyo.Objective(
-                expr=upper_model.price[timestamp, zone],
-                sense=pyo.maximize,
-            )
-            _solve_checked(
-                solver=solver,
-                model=upper_model,
-                solver_options=solver_options,
-                context="Upper-price subproblem",
-            )
-            upper_price[(timestamp, zone)] = float(
-                pyo.value(upper_model.price[timestamp, zone])
-            )
+    all_price_keys = [
+        (product[0], zone)
+        for product in market_products
+        for zone in market_zone_ids
+    ]
 
-            # TODO Check if needed
-            logger.debug(
-                "Price bounds at %s in %s: lower=%s, upper=%s, midpoint=%s",
-                timestamp,
-                zone,
-                lower_price[(timestamp, zone)],
-                upper_price[(timestamp, zone)],
-                0.5 * (
-                    lower_price[(timestamp, zone)]
-                    + upper_price[(timestamp, zone)]
-                ),
-            )    
+    unresolved_price_keys = []
+
+    for key in all_price_keys:
+        if key in fixed_prices:
+            lower_price[key] = fixed_prices[key]
+            upper_price[key] = fixed_prices[key]
+        else:
+            unresolved_price_keys.append(key)
+
+    logger.info(
+        "Pricing: %s of %s MCPs are directly fixed by partially accepted "
+        "simple bids; %s require interval calculations.",
+        len(fixed_prices),
+        len(all_price_keys),
+        len(unresolved_price_keys),
+    )
+
+    if not unresolved_price_keys:
+        return lower_price, upper_price
+
+    price_model = build_price_feasibility_model(
+        orders=orders,
+        market_products=market_products,
+        market_zone_ids=market_zone_ids,
+        fbmc_params=fbmc_params,
+        ntc_params=ntc_params,
+        master_solution=master_solution,
+        price_floor=price_floor,
+        price_cap=price_cap,
+    )
+
+    price_model.objective.deactivate()
+
+    price_model.price_bound_objective = pyo.Objective(
+        expr=0.0,
+        sense=pyo.minimize,
+    )
+
+    for timestamp, zone in unresolved_price_keys:
+        price_variable = price_model.price[timestamp, zone]
+
+        # Exact lower price bound.
+        price_model.price_bound_objective.set_value(price_variable)
+        price_model.price_bound_objective.sense = pyo.minimize
+
+        _solve_checked(
+            solver=solver,
+            model=price_model,
+            solver_options=solver_options,
+            context="Lower-price subproblem",
+        )
+
+        lower_price[(timestamp, zone)] = float(
+            pyo.value(price_variable)
+        )
+
+        # Exact upper price bound.
+        price_model.price_bound_objective.set_value(price_variable)
+        price_model.price_bound_objective.sense = pyo.maximize
+
+        _solve_checked(
+            solver=solver,
+            model=price_model,
+            solver_options=solver_options,
+            context="Upper-price subproblem",
+        )
+
+        upper_price[(timestamp, zone)] = float(
+            pyo.value(price_variable)
+        )
 
     return lower_price, upper_price
 
@@ -1312,16 +1512,22 @@ class ComplexClearingRole(MarketRole):
         super().__init__(marketconfig)
 
         self.solver_name = get_supported_solver_pyomo(
-            marketconfig.param_dict.get("solver_name", "appsi_highs")
+            marketconfig.param_dict.get("solver_name", "gurobi") # changed default to gurobi
         )
         self.solver = SolverFactory(self.solver_name)
         self.solver_options = {}
 
         if self.solver_name == "gurobi":
             self.solver_options = {
-                "cutoff": -1.0,
+                #"cutoff": -1.0,
                 "MIPGap": EPS,
+                "Threads": 8,
             }
+
+        self.log_performance = self.marketconfig.param_dict.get(
+            "log_performance",
+            True,
+        )
 
         self.log_flows = self.marketconfig.param_dict.get(
             "log_flows",
@@ -1384,17 +1590,13 @@ class ComplexClearingRole(MarketRole):
         self,
         market_products: list[MarketProduct],
     ) -> pd.Index:
-        """Validate market-product timestamps."""
-        snapshots = pd.Index(
-            [market_product[0] for market_product in market_products]
-        )
+        """
+        Validate fixed 15-minute products and required network snapshots.
 
-        if snapshots.has_duplicates:
-            raise ValueError(
-                "Market products contain duplicate start timestamps. "
-                "This clearing implementation expects one product per "
-                "timestamp."
-            )
+        If a PyPSA network is configured, every market-product timestamp must
+        exist in ``network.snapshots``.
+        """
+        snapshots = _validate_15_minute_market_products(market_products)
 
         if self.network is not None:
             network_snapshots = pd.Index(self.network.snapshots)
@@ -1402,8 +1604,8 @@ class ComplexClearingRole(MarketRole):
 
             if not missing_snapshots.empty:
                 raise ValueError(
-                    "All market-product start times must be contained in "
-                    "network.snapshots. Missing timestamps: "
+                    "All 15-minute market-product start times must be "
+                    "contained in network.snapshots. Missing timestamps: "
                     f"{list(missing_snapshots)}"
                 )
 
@@ -1532,6 +1734,9 @@ class ComplexClearingRole(MarketRole):
                 "Precomputing FBMC parameters for region %s.",
                 self.flowbased_region,
             )
+
+            fbmc_precompute_start = perf_counter()
+
             raw_fbmc_parameters = precompute_fbmc_parameters(
                 network=self.network,
                 flowbased_region=self.flowbased_region,
@@ -1541,6 +1746,13 @@ class ComplexClearingRole(MarketRole):
                     "fbmc_solver_name"
                 ),
             )
+
+            _log_stage_duration(
+                stage_name="precompute_fbmc_parameters",
+                start_time=fbmc_precompute_start,
+                enabled=self.log_performance,
+            )
+
             fbmc_params = to_clearing_input(raw_fbmc_parameters)
 
         ntc_params = load_ntc_connections(
@@ -1599,6 +1811,8 @@ class ComplexClearingRole(MarketRole):
             4000.0,
         )
 
+        master_pipeline_start = perf_counter()
+
         master_model = build_market_clearing_model(
             orders=orderbook,
             market_products=market_products,
@@ -1608,6 +1822,7 @@ class ComplexClearingRole(MarketRole):
             fbmc_params=fbmc_params,
             ntc_params=ntc_params,
         )
+
         master_model, master_solution = solve_master_with_price_cuts(
             master_model=master_model,
             orders=orderbook,
@@ -1619,8 +1834,18 @@ class ComplexClearingRole(MarketRole):
             price_cap=price_cap,
             solver=self.solver,
             solver_options=self.solver_options,
+            timing_enabled=self.log_performance,
         )
+
+        _log_stage_duration(
+            stage_name="solve_master_with_price_cuts (total)",
+            start_time=master_pipeline_start,
+            enabled=self.log_performance,
+        )
+
         master_welfare = float(pyo.value(master_model.welfare))
+
+        midpoint_price_start = perf_counter()
 
         market_clearing_prices = select_midpoint_prices(
             orders=orderbook,
@@ -1634,6 +1859,14 @@ class ComplexClearingRole(MarketRole):
             solver=self.solver,
             solver_options=self.solver_options,
         )
+
+        _log_stage_duration(
+            stage_name="select_midpoint_prices",
+            start_time=midpoint_price_start,
+            enabled=self.log_performance,
+        )
+        
+        volume_flow_tiebreak_start = perf_counter()
 
         final_model = solve_volume_flow_tiebreak(
             orders=orderbook,
@@ -1650,6 +1883,12 @@ class ComplexClearingRole(MarketRole):
             price_cap=price_cap,
             solver=self.solver,
             solver_options=self.solver_options,
+        )
+
+        _log_stage_duration(
+            stage_name="solve_volume_flow_tiebreak",
+            start_time=volume_flow_tiebreak_start,
+            enabled=self.log_performance,
         )
 
         (
@@ -1685,9 +1924,16 @@ def extract_results(
     log_flows: bool = False,
     fbmc_parameters: dict | None = None,
 ):
-    """Extract accepted/rejected orders, prices, and optional flow results."""
+    """
+    Extract accepted/rejected orders, prices, energy, and optional flow results.
+
+    Reported energy is in MWh and equals accepted MW volume multiplied by the
+    fixed 0.25-hour MTU duration.
+    """
     if pricing_mechanism not in ["pay_as_clear", "pay_as_bid"]:
         raise ValueError(f"Invalid pricing mechanism '{pricing_mechanism}'.")
+
+    _validate_15_minute_market_products(market_products)
 
     accepted_orders: Orderbook = []
     meta = []
@@ -1770,9 +2016,6 @@ def extract_results(
     for zone in market_clearing_prices:
         for product in market_products:
             timestamp = product[0]
-            duration_hours = (
-                product[1] - product[0]
-            ) / timedelta(hours=1)
 
             clear_price = market_clearing_prices[zone][timestamp]
             supply_volume = supply_volume_dict[zone][timestamp]
@@ -1782,8 +2025,12 @@ def extract_results(
                 {
                     "supply_volume": supply_volume,
                     "demand_volume": -demand_volume,
-                    "demand_volume_energy": -demand_volume * duration_hours,
-                    "supply_volume_energy": supply_volume * duration_hours,
+                    "demand_volume_energy": (
+                        -demand_volume * MTU_DURATION_HOURS
+                    ),
+                    "supply_volume_energy": (
+                        supply_volume * MTU_DURATION_HOURS
+                    ),
                     "price": clear_price,
                     "max_price": clear_price,
                     "min_price": clear_price,

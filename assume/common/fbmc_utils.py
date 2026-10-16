@@ -6,52 +6,36 @@
 Utilities for pre-computing Flow-Based Market Coupling (FBMC) parameters.
 
 Implemented:
-- nodal D-2 base case with PyPSA
-- nodal PTDFs
-- GSKs
-- zonal and zone-to-zone PTDFs
-- CNE selection
-- N-1 CNECs using LODFs
+- nodal D-2 base case with PyPSA;
+- nodal PTDFs;
+- GSKs;
+- zonal and zone-to-zone PTDFs;
+- CNE selection;
+- N-1 CNECs using LODFs;
 - direct POMATO-style FB domain representation:
-      zPTDF * NET_EXPORT_FB <= RAM
-- FRM and minRAM
-- an explicit flow-based region
+      zPTDF * NET_EXPORT_FB <= RAM;
+- FRM and minRAM;
+- an explicit flow-based region.
 
-Not implemented:
-- FAVs
-- long-term allocations
-- redispatch
-- preventive N-1 security constraints in the D-2 base case
-- transformers, HVDC links, topology changes
+Only fixed 15-minute market time units are supported.
 
-Hybrid market-model convention
--------------------------------
-Only zones in ``flowbased_region`` receive FB PTDF columns.
+Physical quantities remain in MW:
 
-The later clearing algorithm must use a separate FB net-export variable:
+- PTDFs;
+- RAM;
+- line capacities;
+- line flows;
+- net positions;
+- generator dispatch.
 
-    sum(
-        PTDF[cnec, fb_zone] * NET_EXPORT_FB[fb_zone]
-        for fb_zone in flowbased_region
-    ) <= RAM[cnec]
-
-For zones connected to both the FB region and ATC-based connections, the
-clearing model must keep the commercial decomposition explicit:
-
-    total_net_position[zone]
-      = net_export_fb[zone]
-      + net_export_from_atc_lines[zone]
-
-Consequently, this module does not infer FB reference net positions from
-physical boundary-line flows. When the FB region contains all market zones,
-ordinary D-2 zonal net positions can be used as FB reference net positions.
-Otherwise, zero FB reference net positions are used and external base-case
-effects remain embedded in f_ref.
+The PyPSA D-2 objective uses a 0.25-hour snapshot weighting because
+generator marginal costs are EUR/MWh and generator dispatch is MW.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Hashable
 
@@ -64,6 +48,9 @@ from assume.common.grid_utils import get_supported_solver_linopy
 logger = logging.getLogger(__name__)
 
 BASECASE_CONTINGENCY = "__basecase__"
+
+MTU_DURATION = timedelta(minutes=15)
+MTU_DURATION_HOURS = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -154,30 +141,107 @@ def _validate_network(
             )
 
 
+def _validate_15_minute_snapshots(
+    snapshots: pd.Index,
+) -> pd.DatetimeIndex:
+    """
+    Validate fixed 15-minute FBMC snapshots.
+
+    Snapshots must be unique datetime timestamps on 15-minute boundaries.
+    Multiple snapshots must be ordered and separated by exactly 15 minutes.
+    """
+    try:
+        timestamps = pd.DatetimeIndex(snapshots)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "FBMC snapshots must be valid datetime timestamps."
+        ) from exc
+
+    if timestamps.empty:
+        raise ValueError(
+            "No snapshots are available. Provide 15-minute snapshots "
+            "explicitly or store them in the PyPSA network."
+        )
+
+    if timestamps.hasnans:
+        raise ValueError("FBMC snapshots must not contain null timestamps.")
+
+    if timestamps.has_duplicates:
+        raise ValueError("FBMC snapshots must be unique.")
+
+    for timestamp in timestamps:
+        if (
+            timestamp.minute % 15 != 0
+            or timestamp.second != 0
+            or timestamp.microsecond != 0
+            or timestamp.nanosecond != 0
+        ):
+            raise ValueError(
+                "FBMC snapshots must be aligned to 15-minute boundaries. "
+                f"Invalid timestamp: '{timestamp}'."
+            )
+
+    if len(timestamps) > 1:
+        differences = timestamps[1:] - timestamps[:-1]
+
+        if not (differences == pd.Timedelta(MTU_DURATION)).all():
+            raise ValueError(
+                "FBMC snapshots must be consecutive 15-minute timestamps. "
+                "Hourly, mixed-resolution, unordered, and gapped snapshot "
+                "inputs are not supported."
+            )
+
+    return timestamps
+
+
 def _resolve_snapshots(
     network: pypsa.Network,
     snapshots: pd.Index | None,
-) -> pd.Index:
+) -> pd.DatetimeIndex:
     """
-    Determine snapshots used for the FBMC calculation.
+    Determine and validate snapshots used for the FBMC calculation.
 
     If snapshots is omitted, the existing network snapshots are used.
+    Only fixed consecutive 15-minute snapshots are supported.
     """
     if snapshots is None:
         snapshots = pd.Index(network.snapshots)
     else:
         snapshots = pd.Index(snapshots)
 
-    if snapshots.empty:
-        raise ValueError(
-            "No snapshots are available. Provide snapshots explicitly or "
-            "store snapshots in the PyPSA network."
-        )
+    return _validate_15_minute_snapshots(snapshots)
 
-    if snapshots.has_duplicates:
-        raise ValueError("Snapshots must be unique.")
 
-    return snapshots
+def _set_objective_snapshot_weighting(
+    network: pypsa.Network,
+    snapshots: pd.DatetimeIndex,
+) -> None:
+    """
+    Set the objective weighting to 0.25 hours for every 15-minute snapshot.
+
+    Only the objective weighting is changed. Physical quantities remain in MW,
+    and no other PyPSA snapshot-weighting columns are overwritten.
+    """
+    snapshot_weightings = getattr(network, "snapshot_weightings", None)
+
+    if isinstance(snapshot_weightings, pd.DataFrame):
+        if "objective" not in snapshot_weightings.columns:
+            snapshot_weightings["objective"] = 1.0
+
+        snapshot_weightings.loc[
+            snapshots,
+            "objective",
+        ] = MTU_DURATION_HOURS
+        return
+
+    if isinstance(snapshot_weightings, pd.Series):
+        snapshot_weightings.loc[snapshots] = MTU_DURATION_HOURS
+        return
+
+    raise RuntimeError(
+        "The installed PyPSA version does not expose snapshot_weightings "
+        "as a pandas DataFrame or Series."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +421,10 @@ def solve_d2_base_case(
 
     The caller's network is never modified.
 
+    Generator marginal costs are EUR/MWh and dispatch remains in MW. The
+    PyPSA objective snapshot weighting is set to 0.25 hours for every fixed
+    15-minute MTU so that the optimisation objective is measured in EUR.
+
     If CNEs are supplied, FRM is reserved on those normal-state CNEs by
     reducing their D-2 operational capacity to:
 
@@ -367,8 +435,11 @@ def solve_d2_base_case(
     if not 0.0 <= frm < 1.0:
         raise ValueError("frm must be a fraction in [0, 1).")
 
+    snapshots = _validate_15_minute_snapshots(pd.Index(snapshots))
+
     n = network.copy()
     n.set_snapshots(snapshots)
+    _set_objective_snapshot_weighting(n, snapshots)
 
     load_profile = _load_profile(network, snapshots)
     generator_availability = _generator_availability_profile(network, snapshots)
@@ -405,7 +476,7 @@ def solve_d2_base_case(
         solver_name=selected_solver,
         log_to_console=False,
         progress=False,
-        include_objective_constant = True,
+        include_objective_constant=True,
     )
 
     if status != "ok":
@@ -655,11 +726,11 @@ def create_gsk(
     Create a GSK matrix with buses as rows and zones as columns.
 
     Supported strategies:
-    - flat_node: equal weights over all nodes in a zone
-    - flat_gen: equal weights over conventional-generator nodes
-    - pnom: proportional to installed generator capacity
-    - pmax_remaining: proportional to unused D-2 generation capacity
-    - dispatch_prop: proportional to D-2 dispatch
+    - flat_node: equal weights over all nodes in a zone;
+    - flat_gen: equal weights over conventional-generator nodes;
+    - pnom: proportional to installed generator capacity;
+    - pmax_remaining: proportional to unused D-2 generation capacity;
+    - dispatch_prop: proportional to D-2 dispatch.
 
     The GSK is created for all zones because it is also used for physical
     CNE selection. Only FB-region columns are retained for the D-1 FB domain.
@@ -1127,7 +1198,7 @@ def calculate_direct_ram(
     min_ram: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Calculate direct POMATO-style RAM values.
+    Calculate direct RAM values in MW.
 
     For every directional CNEC:
 
@@ -1144,6 +1215,9 @@ def calculate_direct_ram(
             zPTDF[t, cnec, fb_zone] * NET_EXPORT_FB[t, fb_zone]
             for fb_zone in flowbased_region
         ) <= RAM[t, cnec]
+
+    No quantity is scaled by 0.25. PTDFs, RAM, capacities, and net positions
+    remain MW-based.
     """
     if not 0.0 <= frm < 1.0:
         raise ValueError("frm must be a fraction in [0, 1).")
@@ -1193,9 +1267,7 @@ def calculate_direct_ram(
         np_ref = fb_reference_net_positions.loc[snapshot, fb_zones]
 
         explained_fb_flow = ptdf.dot(np_ref)
-
         f_ref = reference_flows.loc[snapshot] - explained_fb_flow
-
         raw_ram = capacity - frm_mw.loc[snapshot] - f_ref
 
         reference_flow_without_market.loc[snapshot] = f_ref
@@ -1224,10 +1296,10 @@ def calculate_direct_ram(
 
 def precompute_fbmc_parameters(
     network: pypsa.Network,
-    alpha: float = 0.05,
-    frm: float = 0.10,
-    min_ram: float = 0.10,
-    lodf_sensitivity: float = 0.10,
+    alpha: float = 0.25, # default 0.05
+    frm: float = 0.10,  # default 0.10
+    min_ram: float = 0.0, # default 0.10
+    lodf_sensitivity: float = 0.50, # default 0.10
     gsk_cne_strategy: str = "flat_gen",
     gsk_market_strategy: str = "flat_gen",
     include_cross_border_lines: bool = True,
@@ -1239,7 +1311,9 @@ def precompute_fbmc_parameters(
     """
     Run the complete FBMC parameter pre-computation workflow.
 
-    The returned FB domain uses the direct representation:
+    Only unique, consecutive, fixed 15-minute snapshots are accepted.
+
+    The returned FB domain uses the direct MW-based representation:
 
         sum(
             zPTDF[t, cnec, fb_zone] * NET_EXPORT_FB[t, fb_zone]
@@ -1274,7 +1348,8 @@ def precompute_fbmc_parameters(
         zone_column:
             Column in ``network.buses`` containing bidding-zone IDs.
         snapshots:
-            Optional snapshots. Defaults to ``network.snapshots``.
+            Optional fixed 15-minute snapshots. Defaults to
+            ``network.snapshots``.
         solver_name:
             Optional PyPSA/linopy solver name.
     """
@@ -1510,7 +1585,7 @@ def precompute_fbmc_parameters(
 
 
 # ---------------------------------------------------------------------------
-# Conversion for the future EUPHEMIA-like clearing model
+# Conversion for the EUPHEMIA-like clearing model
 # ---------------------------------------------------------------------------
 
 
@@ -1518,7 +1593,7 @@ def to_clearing_input(fbmc_parameters: dict) -> dict:
     """
     Convert FBMC results to tuple-indexed dictionaries for Pyomo.
 
-    The later clearing algorithm must implement:
+    The later clearing algorithm must implement the MW-based constraint:
 
         sum(
             ptdf_zonal[t, cnec, fb_zone]

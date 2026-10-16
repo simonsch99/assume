@@ -5,9 +5,11 @@
 """
 Test tool for the EUPHEMIA-like market-clearing implementation.
 
+Only fixed 15-minute day-ahead market time units (MTUs) are supported.
+
 Supported input:
 - Existing PyPSA network or PyPSA NetCDF path;
-- EUPHEMIA-like hourly order CSV;
+- EUPHEMIA-like 15-minute simple-order CSV;
 - EUPHEMIA-like block-order CSV;
 - NTC connection CSV/DataFrame;
 - an explicit FBMC bidding-zone region.
@@ -41,26 +43,36 @@ from assume.markets.clearing_algorithms.euphemia_like import (
 
 logger = logging.getLogger(__name__)
 
+MTU_DURATION = timedelta(minutes=15)
+MTU_DURATION_HOURS = 0.25
+
 
 # ---------------------------------------------------------------------------
 # EUPHEMIA-like CSV readers
 # ---------------------------------------------------------------------------
 
 
-class HourlyOrderReader:
+class QuarterHourlyOrderReader:
     """
-    Read simple hourly orders from a comma-separated EUPHEMIA-like CSV.
+    Read simple 15-minute orders from a comma-separated EUPHEMIA-like CSV.
 
     Expected row layout, without header:
 
         0: bid ID
-        1: order type, e.g. HOURLY
+        1: order type
         2: optional portfolio ID
-        3: delivery hour, 1..24
+        3: delivery interval, 1..96
         4: price
         5: quantity, always positive
         6: Purchase or Sell
         7: bidding zone
+
+    Delivery intervals are mapped as follows:
+
+        interval 1  -> 00:00
+        interval 2  -> 00:15
+        ...
+        interval 96 -> 23:45
 
     CSV convention:
         Purchase -> positive quantity in CSV -> negative ASSUME volume
@@ -71,6 +83,7 @@ class HourlyOrderReader:
         self,
         path: str | Path,
     ) -> list[dict]:
+        """Read simple 15-minute orders from a CSV file."""
         orders = []
 
         with Path(path).open(newline="") as file:
@@ -79,7 +92,8 @@ class HourlyOrderReader:
             for line_number, row in enumerate(reader, start=1):
                 if len(row) < 8:
                     logger.warning(
-                        "Skipping hourly row %s: expected at least 8 columns.",
+                        "Skipping 15-minute order row %s: expected at "
+                        "least 8 columns.",
                         line_number,
                     )
                     continue
@@ -90,32 +104,44 @@ class HourlyOrderReader:
                     continue
 
                 try:
-                    hour = int(row[3]) - 1
+                    interval = int(row[3]) - 1
 
-                    if not 0 <= hour < 24:
+                    if not 0 <= interval < 96:
                         raise ValueError(
-                            f"delivery hour must be in 1..24, got {hour + 1}"
+                            "delivery interval must be in 1..96, "
+                            f"got {interval + 1}"
                         )
 
                     orders.append(
                         {
-                            "raw_id": row[0].strip() or f"hourly_{line_number}",
-                            "side": "BUY" if side == "Purchase" else "SELL",
+                            "raw_id": (
+                                row[0].strip()
+                                or f"quarter_hourly_{line_number}"
+                            ),
+                            "side": (
+                                "BUY"
+                                if side == "Purchase"
+                                else "SELL"
+                            ),
                             "price": float(row[4]),
                             "quantity": float(row[5]),
-                            "hour": hour,
+                            "interval": interval,
                             "bidding_zone": row[7].strip() or "node0",
                         }
                     )
 
                 except ValueError as error:
                     logger.warning(
-                        "Skipping hourly row %s: %s",
+                        "Skipping 15-minute order row %s: %s",
                         line_number,
                         error,
                     )
 
-        logger.info("Read %s hourly orders from %s.", len(orders), path)
+        logger.info(
+            "Read %s 15-minute simple orders from %s.",
+            len(orders),
+            path,
+        )
         return orders
 
 
@@ -133,9 +159,9 @@ class BlockOrderReader:
              C04 = exclusive block
         3: parent bid ID for C02 or exclusive-group ID for C04
         5: price
-        6..29: quantities for hours 1..24
-        30: minimum acceptance ratio
-        32: bidding zone
+        6..101: quantities for delivery intervals 1..96
+        102: minimum acceptance ratio
+        104: bidding zone
 
     CSV convention:
         The input uses the inverse ASSUME volume sign convention.
@@ -148,6 +174,7 @@ class BlockOrderReader:
         self,
         path: str | Path,
     ) -> list[dict]:
+        """Read 15-minute block orders from a CSV file."""
         blocks = []
 
         with Path(path).open(newline="") as file:
@@ -157,9 +184,10 @@ class BlockOrderReader:
                 if not row or row[0].strip() != "BB":
                     continue
 
-                if len(row) < 33:
+                if len(row) < 105:
                     logger.warning(
-                        "Skipping block row %s: expected 33 columns, got %s.",
+                        "Skipping block row %s: expected at least "
+                        "105 columns, got %s.",
                         line_number,
                         len(row),
                     )
@@ -175,22 +203,32 @@ class BlockOrderReader:
                         error,
                     )
 
-        logger.info("Read %s block orders from %s.", len(blocks), path)
+        logger.info(
+            "Read %s 15-minute block orders from %s.",
+            len(blocks),
+            path,
+        )
         return blocks
 
     @staticmethod
     def _read_line(
         row: list[str],
     ) -> dict:
+        """Parse one 96-interval block-order CSV row."""
+        if len(row) < 105:
+            raise ValueError(
+                "Block rows must contain at least 105 columns."
+            )
+
         # Convert EUPHEMIA-style sign convention to ASSUME convention.
         quantities = [
-            -1.0 * float(row[6 + hour])
-            for hour in range(24)
+            -float(row[6 + interval])
+            for interval in range(96)
         ]
 
         minimum_acceptance_ratio = (
-            float(row[30])
-            if row[30].strip()
+            float(row[102])
+            if row[102].strip()
             else None
         )
 
@@ -199,9 +237,9 @@ class BlockOrderReader:
             "type": row[2].strip(),
             "special_id": row[3].strip() or None,
             "price": float(row[5]),
-            "hours": quantities,
+            "intervals": quantities,
             "acc_ratio": minimum_acceptance_ratio,
-            "bidding_zone": row[32].strip() or "node0",
+            "bidding_zone": row[104].strip() or "node0",
         }
 
 
@@ -213,6 +251,8 @@ class BlockOrderReader:
 class ClearingTestTool:
     """
     Test tool for NTC-only, FBMC-only, and hybrid FBMC/NTC clearing.
+
+    Only fixed 15-minute market products are supported.
 
     Example:
 
@@ -226,7 +266,7 @@ class ClearingTestTool:
 
     tool.load_orders(
         delivery_date=datetime(2026, 1, 1),
-        hourly_csv="hourly_orders.csv",
+        quarter_hourly_csv="quarter_hourly_orders.csv",
         block_csv="block_orders.csv",
     )
 
@@ -240,16 +280,22 @@ class ClearingTestTool:
         self,
         market_id: str = "test_market",
         clearing_type: Literal["euphemia_like"] = "euphemia_like",
-        product_duration: timedelta = timedelta(hours=1),
+        product_duration: timedelta = MTU_DURATION,
         network: pypsa.Network | str | Path | None = None,
         flowbased_region: list[str] | None = None,
         ntc_connections: str | Path | pd.DataFrame | None = None,
         zones_identifier: str = "zone_id",
         **market_config_kwargs,
     ):
+        if product_duration != MTU_DURATION:
+            raise ValueError(
+                "ClearingTestTool supports only 15-minute products "
+                f"({MTU_DURATION})."
+            )
+
         self.market_id = market_id
         self.clearing_type = clearing_type
-        self.product_duration = product_duration
+        self.product_duration = MTU_DURATION
         self.market_config_kwargs = market_config_kwargs
 
         self.network: pypsa.Network | None = None
@@ -286,6 +332,7 @@ class ClearingTestTool:
         Load or assign an existing PyPSA network.
 
         The network must contain the selected zone column on its buses.
+        Required 15-minute timestamps are validated after orders are loaded.
         """
         if isinstance(network, pypsa.Network):
             self.network = network
@@ -339,16 +386,21 @@ class ClearingTestTool:
     def load_orders(
         self,
         delivery_date: datetime,
-        hourly_csv: str | Path | None = None,
+        quarter_hourly_csv: str | Path | None = None,
         block_csv: str | Path | None = None,
         default_node: str = "node0",
     ) -> Orderbook:
         """
-        Read hourly and/or block order files and create an ASSUME orderbook.
+        Read 15-minute simple and/or block-order files.
+
+        The generated delivery day always contains exactly 96 fixed
+        15-minute market products, independently of whether bids exist
+        in every interval.
         """
-        if hourly_csv is None and block_csv is None:
+        if quarter_hourly_csv is None and block_csv is None:
             raise ValueError(
-                "At least one of hourly_csv or block_csv must be supplied."
+                "At least one of quarter_hourly_csv or block_csv must "
+                "be supplied."
             )
 
         self.delivery_date = (
@@ -359,12 +411,14 @@ class ClearingTestTool:
 
         orderbook: Orderbook = []
 
-        if hourly_csv is not None:
-            hourly_orders = HourlyOrderReader().read(hourly_csv)
+        if quarter_hourly_csv is not None:
+            quarter_hourly_orders = QuarterHourlyOrderReader().read(
+                quarter_hourly_csv
+            )
 
             orderbook.extend(
-                self._hourly_to_orderbook(
-                    hourly_orders,
+                self._quarter_hourly_to_orderbook(
+                    quarter_hourly_orders,
                     default_node,
                 )
             )
@@ -380,13 +434,17 @@ class ClearingTestTool:
             )
 
         if not orderbook:
-            raise ValueError("No valid orders could be read from the input files.")
+            raise ValueError(
+                "No valid orders could be read from the input files."
+            )
 
         self._validate_linked_block_parents(orderbook)
 
         self.orderbook = orderbook
         self.submitted_order_count = len(orderbook)
         self.market_products = self._build_market_products()
+
+        self._validate_network_market_product_snapshots()
 
         logger.info(
             "Built orderbook with %s orders: %s simple and %s block orders.",
@@ -403,25 +461,37 @@ class ClearingTestTool:
 
         return self.orderbook
 
-    def _hour_start(
+    def _interval_start(
         self,
-        hour: int,
+        interval: int,
     ) -> datetime:
+        """
+        Return the start timestamp of a zero-based delivery interval.
+
+        Interval zero corresponds to delivery interval 1 at 00:00.
+        Interval 95 corresponds to delivery interval 96 at 23:45.
+        """
         if self.delivery_date is None:
             raise RuntimeError("delivery_date was not set.")
 
-        return self.delivery_date + hour * self.product_duration
+        if not 0 <= interval < 96:
+            raise ValueError(
+                "Delivery interval index must be in 0..95, "
+                f"got {interval}."
+            )
 
-    def _hourly_to_orderbook(
+        return self.delivery_date + interval * MTU_DURATION
+
+    def _quarter_hourly_to_orderbook(
         self,
-        hourly_orders: list[dict],
+        quarter_hourly_orders: list[dict],
         default_node: str,
     ) -> Orderbook:
-        """Convert parsed hourly rows to ASSUME simple orders."""
+        """Convert parsed 15-minute rows to ASSUME simple orders."""
         orderbook: Orderbook = []
 
-        for index, order in enumerate(hourly_orders):
-            start_time = self._hour_start(order["hour"])
+        for index, order in enumerate(quarter_hourly_orders):
+            start_time = self._interval_start(order["interval"])
 
             # ASSUME convention:
             # positive volume = supply
@@ -435,7 +505,8 @@ class ClearingTestTool:
             orderbook.append(
                 {
                     "bid_id": (
-                        f"SB_{order['raw_id']}_{order['hour']:02d}_{index}"
+                        f"SB_{order['raw_id']}_"
+                        f"{order['interval']:02d}_{index}"
                     ),
                     "agent_addr": (
                         f"agent_{order['bidding_zone'] or default_node}",
@@ -446,7 +517,7 @@ class ClearingTestTool:
                     "volume": volume,
                     "node": order["bidding_zone"] or default_node,
                     "start_time": start_time,
-                    "end_time": start_time + self.product_duration,
+                    "end_time": start_time + MTU_DURATION,
                     "only_hours": None,
                     "min_acceptance_ratio": None,
                     "parent_bid_id": None,
@@ -461,13 +532,13 @@ class ClearingTestTool:
         blocks: list[dict],
         default_node: str,
     ) -> Orderbook:
-        """Convert parsed block rows to ASSUME block/link orders."""
+        """Convert parsed 96-interval block rows to ASSUME block orders."""
         orderbook: Orderbook = []
 
         for block in blocks:
             volume = {
-                self._hour_start(hour): quantity
-                for hour, quantity in enumerate(block["hours"])
+                self._interval_start(interval): quantity
+                for interval, quantity in enumerate(block["intervals"])
                 if abs(quantity) > 0.0
             }
 
@@ -500,7 +571,7 @@ class ClearingTestTool:
                     "volume": volume,
                     "node": block["bidding_zone"] or default_node,
                     "start_time": timestamps[0],
-                    "end_time": timestamps[-1] + self.product_duration,
+                    "end_time": timestamps[-1] + MTU_DURATION,
                     "only_hours": None,
                     "min_acceptance_ratio": block["acc_ratio"],
                     "parent_bid_id": (
@@ -545,23 +616,51 @@ class ClearingTestTool:
     def _build_market_products(
         self,
     ) -> list[MarketProduct]:
-        """Build one market product per delivery timestamp in the orderbook."""
-        timestamps = set()
+        """
+        Build exactly 96 fixed 15-minute market products for the day.
 
-        for order in self.orderbook:
-            if order["bid_type"] == "SB":
-                timestamps.add(order["start_time"])
-            else:
-                timestamps.update(order["volume"])
+        Products are created even if no bid exists in a specific MTU.
+        """
+        if self.delivery_date is None:
+            raise RuntimeError("delivery_date was not set.")
 
         return [
             (
-                timestamp,
-                timestamp + self.product_duration,
+                self.delivery_date + interval * MTU_DURATION,
+                self.delivery_date + (interval + 1) * MTU_DURATION,
                 None,
             )
-            for timestamp in sorted(timestamps)
+            for interval in range(96)
         ]
+
+    def _validate_network_market_product_snapshots(self) -> None:
+        """
+        Require a supplied PyPSA network to contain every daily 15-minute MTU.
+
+        An hourly network is rejected because it does not contain the 15-minute
+        timestamps required for all 96 delivery intervals.
+        """
+        if self.network is None:
+            return
+
+        required_snapshots = pd.Index(
+            [product[0] for product in self.market_products]
+        )
+        network_snapshots = pd.Index(self.network.snapshots)
+
+        if network_snapshots.has_duplicates:
+            raise ValueError(
+                "The supplied PyPSA network contains duplicate snapshots."
+            )
+
+        missing_snapshots = required_snapshots.difference(network_snapshots)
+
+        if not missing_snapshots.empty:
+            raise ValueError(
+                "The supplied PyPSA network must contain every required "
+                "15-minute delivery timestamp. Missing timestamps: "
+                f"{list(missing_snapshots)}"
+            )
 
     # ------------------------------------------------------------------
     # Market configuration and clearing
@@ -570,6 +669,7 @@ class ClearingTestTool:
     def _create_market_config(
         self,
     ) -> MarketConfig:
+        """Create a market configuration for fixed 15-minute products."""
         if not self.market_products:
             raise ValueError(
                 "No market products exist. Call load_orders() first."
@@ -580,7 +680,7 @@ class ClearingTestTool:
         market_open = first_start - timedelta(hours=12)
 
         param_dict = {
-            "solver_name": "gurobipy",
+            "solver_name": "gurobi",
             "log_flows": True,
             "pricing_mechanism": "pay_as_clear",
             "network": self.network,
@@ -604,8 +704,8 @@ class ClearingTestTool:
             "market_mechanism": self.clearing_type,
             "market_products": [
                 MarketProduct(
-                    duration=self.product_duration,
-                    count=len(self.market_products),
+                    duration=MTU_DURATION,
+                    count=96,
                     first_delivery=first_start - market_open,
                 )
             ],
@@ -635,7 +735,7 @@ class ClearingTestTool:
     def run_clearing(
         self,
     ) -> dict:
-        """Run EUPHEMIA-like market clearing."""
+        """Run EUPHEMIA-like market clearing for the 96 daily MTUs."""
         if not self.orderbook:
             raise ValueError("No orders loaded. Call load_orders() first.")
 
@@ -649,14 +749,15 @@ class ClearingTestTool:
                 f"Unknown clearing type '{self.clearing_type}'."
             )
 
+        self._validate_network_market_product_snapshots()
         market_config = self._create_market_config()
 
         self.clearing_algorithm = EuphemiaLikeClearingRole(
             market_config
         )
 
-        # The clearing role may remove paradoxically accepted blocks from
-        # its supplied orderbook. Preserve self.orderbook for later inspection.
+        # The clearing role may modify the supplied orderbook. Preserve the
+        # original self.orderbook for inspection after the clearing.
         working_orderbook = copy.deepcopy(self.orderbook)
 
         # Mango-free validation setup.
@@ -671,7 +772,7 @@ class ClearingTestTool:
             )
 
         logger.info(
-            "Running '%s' for market '%s' over %s market products.",
+            "Running '%s' for market '%s' over %s 15-minute MTUs.",
             self.clearing_type,
             self.market_id,
             len(self.market_products),
@@ -823,9 +924,11 @@ class ClearingTestTool:
                 "price",
                 "supply_volume",
                 "demand_volume",
+                "supply_volume_energy",
+                "demand_volume_energy",
             ]
 
-            print("\nMarket outcome in the first delivery hour:")
+            print("\nMarket outcome in the first 15-minute interval:")
             print(
                 meta.loc[
                     meta["product_start"] == first_timestamp,
@@ -839,7 +942,10 @@ class ClearingTestTool:
             flows = pd.DataFrame(line_results)
             first_timestamp = flows["time"].min()
 
-            print("\nCommercial flow variables in the first delivery hour:")
+            print(
+                "\nCommercial flow variables in the first "
+                "15-minute interval:"
+            )
             print(
                 flows.loc[
                     flows["time"] == first_timestamp
@@ -847,4 +953,3 @@ class ClearingTestTool:
             )
 
         print("=" * 78 + "\n")
-
