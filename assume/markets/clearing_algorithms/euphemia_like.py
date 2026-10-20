@@ -34,6 +34,8 @@ from datetime import timedelta
 from operator import itemgetter
 from pathlib import Path
 from time import perf_counter 
+from collections.abc import Mapping
+from math import isfinite
 
 import pandas as pd
 import pyomo.environ as pyo
@@ -76,7 +78,246 @@ EPS = 1e-5  # TODO Decide on a good value
 MTU_DURATION = timedelta(minutes=15)
 MTU_DURATION_HOURS = 0.25
 
+def _storage_orders(orders: Orderbook) -> dict[str, dict]:
+    """Return Storage Orders indexed by bid ID."""
+    return {
+        order["bid_id"]: order
+        for order in orders
+        if order.get("bid_type") == "SO"
+    }
 
+
+def _validate_storage_order_static(order: dict) -> None:
+    """Validate Storage Order fields that do not depend on the MTU horizon."""
+    required_fields = {
+        "node",
+        "max_energy",
+        "max_input_power",
+        "max_output_power",
+        "cycling_cost",
+    }
+    missing = [
+        field
+        for field in required_fields
+        if order.get(field) is None
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Storage Order '{order.get('bid_id')}' is missing required "
+            f"field(s): {sorted(missing)}."
+        )
+
+    for field in (
+        "max_energy",
+        "max_input_power",
+        "max_output_power",
+    ):
+        if not isinstance(order[field], Mapping):
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' field '{field}' "
+                "must be a timestamp-to-value mapping."
+            )
+
+    for field, default in (
+        ("starting_energy", 0.0),
+        ("efficiency", 1.0),
+        ("end_of_day_value", 0.0),
+        ("cycling_cost", None),
+    ):
+        value = order.get(field, default)
+
+        if value is None:
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' field '{field}' "
+                "must not be null."
+            )
+
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' field '{field}' "
+                "must be numeric."
+            ) from exc
+
+        if not isfinite(value):
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' field '{field}' "
+                "must be finite."
+            )
+
+        order[field] = value
+
+    if order["starting_energy"] < 0:
+        raise ValueError(
+            f"Storage Order '{order['bid_id']}' has negative "
+            "starting_energy."
+        )
+
+    if not 0.0 <= order["efficiency"] <= 1.0:
+        raise ValueError(
+            f"Storage Order '{order['bid_id']}' efficiency must be in "
+            "[0, 1]."
+        )
+
+    if order["cycling_cost"] < 0:
+        raise ValueError(
+            f"Storage Order '{order['bid_id']}' cycling_cost must be "
+            "non-negative."
+        )
+
+
+def _normalise_storage_series(
+    order: dict,
+    field: str,
+    snapshots: list,
+    default: float | None = None,
+) -> dict:
+    """Validate complete Storage Order time-series coverage."""
+    values = order.get(field)
+
+    if values is None:
+        if default is None:
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' is missing required "
+                f"time series '{field}'."
+            )
+        values = {timestamp: default for timestamp in snapshots}
+
+    if not isinstance(values, Mapping):
+        raise ValueError(
+            f"Storage Order '{order['bid_id']}' field '{field}' must be "
+            "a timestamp-to-value mapping."
+        )
+
+    missing = [timestamp for timestamp in snapshots if timestamp not in values]
+    extra = [timestamp for timestamp in values if timestamp not in snapshots]
+
+    if missing or extra:
+        raise ValueError(
+            f"Storage Order '{order['bid_id']}' field '{field}' must cover "
+            "exactly all market MTUs. "
+            f"Missing: {missing[:5]}; extra: {extra[:5]}."
+        )
+
+    result = {}
+
+    for timestamp in snapshots:
+        try:
+            value = float(values[timestamp])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' field '{field}' at "
+                f"'{timestamp}' must be numeric."
+            ) from exc
+
+        if not isfinite(value):
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' field '{field}' at "
+                f"'{timestamp}' must be finite."
+            )
+
+        if value < 0:
+            raise ValueError(
+                f"Storage Order '{order['bid_id']}' field '{field}' at "
+                f"'{timestamp}' must be non-negative."
+            )
+
+        result[timestamp] = value
+
+    return result
+
+
+def _validate_and_normalise_storage_orders(
+    orders: Orderbook,
+    snapshots: list,
+) -> None:
+    """Validate and normalise Storage Orders for the clearing horizon."""
+    for order in orders:
+        if order.get("bid_type") != "SO":
+            continue
+
+        _validate_storage_order_static(order)
+
+        order["max_energy"] = _normalise_storage_series(
+            order,
+            "max_energy",
+            snapshots,
+        )
+        order["max_input_power"] = _normalise_storage_series(
+            order,
+            "max_input_power",
+            snapshots,
+        )
+        order["max_output_power"] = _normalise_storage_series(
+            order,
+            "max_output_power",
+            snapshots,
+        )
+        order["min_energy"] = _normalise_storage_series(
+            order,
+            "min_energy",
+            snapshots,
+            default=0.0,
+        )
+
+        for timestamp in snapshots:
+            if order["min_energy"][timestamp] > order["max_energy"][timestamp]:
+                raise ValueError(
+                    f"Storage Order '{order['bid_id']}' violates "
+                    "0 <= min_energy[t] <= max_energy[t] at "
+                    f"'{timestamp}'."
+                )
+
+
+def _add_storage_constraints(
+    model: pyo.ConcreteModel,
+    storage_orders: dict[str, dict],
+    snapshots: list,
+) -> None:
+    """Add continuous charge, discharge, and SOC constraints."""
+    if not storage_orders:
+        return
+
+    model.storage_constraints = pyo.ConstraintList()
+
+    for bid_id, order in storage_orders.items():
+        for index, timestamp in enumerate(snapshots):
+            previous_soc = (
+                order["starting_energy"]
+                if index == 0
+                else model.soc[bid_id, snapshots[index - 1]]
+            )
+
+            model.storage_constraints.add(
+                model.soc[bid_id, timestamp]
+                == previous_soc
+                + MTU_DURATION_HOURS
+                * order["efficiency"]
+                * model.charge[bid_id, timestamp]
+                - MTU_DURATION_HOURS
+                * model.discharge[bid_id, timestamp]
+            )
+
+            model.storage_constraints.add(
+                model.soc[bid_id, timestamp]
+                >= order["min_energy"][timestamp]
+            )
+            model.storage_constraints.add(
+                model.soc[bid_id, timestamp]
+                <= order["max_energy"][timestamp]
+            )
+
+            model.storage_constraints.add(
+                model.charge[bid_id, timestamp]
+                <= order["max_input_power"][timestamp]
+            )
+            model.storage_constraints.add(
+                model.discharge[bid_id, timestamp]
+                <= order["max_output_power"][timestamp]
+            )
+            
 def _validate_15_minute_market_products(
     market_products: list[MarketProduct],
 ) -> pd.Index:
@@ -298,6 +539,15 @@ def _get_order_net_position_expression(
                 order["volume"][timestamp] * model.xb[order["bid_id"]]
             )
 
+        elif (
+            order["bid_type"] == "SO"
+            and order["node"] == zone
+        ):
+            expression += (
+                model.discharge[order["bid_id"], timestamp]
+                - model.charge[order["bid_id"], timestamp]
+            )
+
     return expression
 
 
@@ -319,6 +569,7 @@ def market_clearing_opt_constraints(
     fbmc_zone_ids = list(fbmc_params.get("fbmc_zone_ids", []))
     cnec_list = list(fbmc_params.get("cnec_list", []))
     ntc_line_ids = list(ntc_params.get("line_ids", []))
+    storage_orders = _storage_orders(orders)
 
     model.T = pyo.Set(initialize=snapshots, ordered=True)
     model.zones = pyo.Set(initialize=market_zone_ids, ordered=True)
@@ -340,7 +591,10 @@ def market_clearing_opt_constraints(
             if order["bid_type"] in ["BB", "LB"]
         ]
     )
-
+    model.storage_bids = pyo.Set(
+        initialize=list(storage_orders),
+        ordered=True,
+    )
     model.xs = pyo.Var(
         model.sBids,
         domain=pyo.NonNegativeReals,
@@ -357,6 +611,28 @@ def market_clearing_opt_constraints(
         model.zones,
         domain=pyo.Reals,
     )
+
+    if storage_orders:
+        model.charge = pyo.Var(
+            model.storage_bids,
+            model.T,
+            domain=pyo.NonNegativeReals,
+        )
+        model.discharge = pyo.Var(
+            model.storage_bids,
+            model.T,
+            domain=pyo.NonNegativeReals,
+        )
+        model.soc = pyo.Var(
+            model.storage_bids,
+            model.T,
+            domain=pyo.NonNegativeReals,
+        )
+        _add_storage_constraints(
+            model=model,
+            storage_orders=storage_orders,
+            snapshots=snapshots,
+        )
 
     if fbmc_zone_ids:
         model.net_export_fb = pyo.Var(
@@ -522,6 +798,20 @@ def _build_welfare_expression(
                 for volume in order["volume"].values()
             )
 
+        elif order["bid_type"] == "SO":
+            last_timestamp = list(model.T)[-1]
+
+            welfare += (
+                -sum(
+                    MTU_DURATION_HOURS
+                    * order["cycling_cost"]
+                    * model.discharge[order["bid_id"], timestamp]
+                    for timestamp in model.T
+                )
+                + order["end_of_day_value"]
+                * model.soc[order["bid_id"], last_timestamp]
+            )
+
     return welfare
 
 
@@ -644,7 +934,7 @@ def _solve_checked(
 def _collect_master_solution(model: pyo.ConcreteModel) -> dict:
     """Extract the primal solution required by pricing and tie-breaking."""
     selected_x = {
-        bid_id: int(pyo.value(model.x[bid_id]) >= 0.5) # Converts numeric value into binary block-activation
+        bid_id: int(pyo.value(model.x[bid_id]) >= 0.5)
         for bid_id in model.bBids
     }
     simple_acceptance = {
@@ -655,6 +945,33 @@ def _collect_master_solution(model: pyo.ConcreteModel) -> dict:
         bid_id: min(1.0, max(0.0, float(pyo.value(model.xb[bid_id]))))
         for bid_id in model.bBids
     }
+
+    storage_dispatch = {}
+
+    if hasattr(model, "storage_bids") and len(model.storage_bids):
+        storage_dispatch = {
+            bid_id: {
+                "charge": {
+                    timestamp: float(
+                        pyo.value(model.charge[bid_id, timestamp])
+                    )
+                    for timestamp in model.T
+                },
+                "discharge": {
+                    timestamp: float(
+                        pyo.value(model.discharge[bid_id, timestamp])
+                    )
+                    for timestamp in model.T
+                },
+                "soc": {
+                    timestamp: float(
+                        pyo.value(model.soc[bid_id, timestamp])
+                    )
+                    for timestamp in model.T
+                },
+            }
+            for bid_id in model.storage_bids
+        }
 
     ntc_flow = {}
     fb_net_export = {}
@@ -681,10 +998,173 @@ def _collect_master_solution(model: pyo.ConcreteModel) -> dict:
         "selected_x": selected_x,
         "simple_acceptance": simple_acceptance,
         "block_acceptance": block_acceptance,
+        "storage_dispatch": storage_dispatch,
         "ntc_flow": ntc_flow,
         "fb_net_export": fb_net_export,
     }
 
+def _add_storage_price_optimality_conditions(
+    model: pyo.ConcreteModel,
+    orders: Orderbook,
+    master_solution: dict,
+) -> None:
+    """
+    Add LP dual feasibility and strong-duality conditions for Storage Orders.
+
+    The cleared storage dispatch is fixed through ``master_solution``.
+    These constraints require that the selected zonal prices make this
+    dispatch profit-maximising over all feasible continuous storage profiles.
+    """
+    storage_orders = _storage_orders(orders)
+
+    if not storage_orders:
+        return
+
+    snapshots = list(model.T)
+    last_timestamp = snapshots[-1]
+
+    model.storage_bids = pyo.Set(
+        initialize=list(storage_orders),
+        ordered=True,
+    )
+
+    # Dual variables for charge upper/lower bounds.
+    model.storage_charge_upper_dual = pyo.Var(
+        model.storage_bids,
+        model.T,
+        domain=pyo.NonNegativeReals,
+    )
+    model.storage_charge_lower_dual = pyo.Var(
+        model.storage_bids,
+        model.T,
+        domain=pyo.NonNegativeReals,
+    )
+
+    # Dual variables for discharge upper/lower bounds.
+    model.storage_discharge_upper_dual = pyo.Var(
+        model.storage_bids,
+        model.T,
+        domain=pyo.NonNegativeReals,
+    )
+    model.storage_discharge_lower_dual = pyo.Var(
+        model.storage_bids,
+        model.T,
+        domain=pyo.NonNegativeReals,
+    )
+
+    # Dual variables for SOC upper/lower bounds.
+    model.storage_soc_upper_dual = pyo.Var(
+        model.storage_bids,
+        model.T,
+        domain=pyo.NonNegativeReals,
+    )
+    model.storage_soc_lower_dual = pyo.Var(
+        model.storage_bids,
+        model.T,
+        domain=pyo.NonNegativeReals,
+    )
+
+    # Free dual variables for SOC transition equalities.
+    model.storage_soc_balance_dual = pyo.Var(
+        model.storage_bids,
+        model.T,
+        domain=pyo.Reals,
+    )
+
+    model.storage_price_optimality = pyo.ConstraintList()
+
+    for bid_id, order in storage_orders.items():
+        dispatch = master_solution["storage_dispatch"][bid_id]
+
+        for index, timestamp in enumerate(snapshots):
+            price = model.price[timestamp, order["node"]]
+            soc_dual = model.storage_soc_balance_dual[bid_id, timestamp]
+
+            # Stationarity with respect to charge[t].
+            model.storage_price_optimality.add(
+                -MTU_DURATION_HOURS * price
+                - MTU_DURATION_HOURS * order["efficiency"] * soc_dual
+                - model.storage_charge_upper_dual[bid_id, timestamp]
+                + model.storage_charge_lower_dual[bid_id, timestamp]
+                == 0.0
+            )
+
+            # Stationarity with respect to discharge[t].
+            model.storage_price_optimality.add(
+                MTU_DURATION_HOURS
+                * (price - order["cycling_cost"])
+                + MTU_DURATION_HOURS * soc_dual
+                - model.storage_discharge_upper_dual[bid_id, timestamp]
+                + model.storage_discharge_lower_dual[bid_id, timestamp]
+                == 0.0
+            )
+
+            # Stationarity with respect to SOC[t].
+            if timestamp == last_timestamp:
+                model.storage_price_optimality.add(
+                    order["end_of_day_value"]
+                    + soc_dual
+                    - model.storage_soc_upper_dual[bid_id, timestamp]
+                    + model.storage_soc_lower_dual[bid_id, timestamp]
+                    == 0.0
+                )
+            else:
+                next_timestamp = snapshots[index + 1]
+
+                model.storage_price_optimality.add(
+                    soc_dual
+                    - model.storage_soc_balance_dual[
+                        bid_id,
+                        next_timestamp,
+                    ]
+                    - model.storage_soc_upper_dual[bid_id, timestamp]
+                    + model.storage_soc_lower_dual[bid_id, timestamp]
+                    == 0.0
+                )
+
+        cleared_surplus = (
+            sum(
+                MTU_DURATION_HOURS
+                * (
+                    model.price[timestamp, order["node"]]
+                    * (
+                        dispatch["discharge"][timestamp]
+                        - dispatch["charge"][timestamp]
+                    )
+                    - order["cycling_cost"]
+                    * dispatch["discharge"][timestamp]
+                )
+                for timestamp in snapshots
+            )
+            + order["end_of_day_value"]
+            * dispatch["soc"][last_timestamp]
+        )
+
+        dual_objective = (
+            sum(
+                model.storage_charge_upper_dual[bid_id, timestamp]
+                * order["max_input_power"][timestamp]
+                + model.storage_discharge_upper_dual[bid_id, timestamp]
+                * order["max_output_power"][timestamp]
+                + model.storage_soc_upper_dual[bid_id, timestamp]
+                * order["max_energy"][timestamp]
+                - model.storage_soc_lower_dual[bid_id, timestamp]
+                * order["min_energy"][timestamp]
+                for timestamp in snapshots
+            )
+            - model.storage_soc_balance_dual[bid_id, snapshots[0]]
+            * order["starting_energy"]
+        )
+
+        # Strong duality: the cleared primal storage surplus equals the
+        # storage LP dual objective. EPS avoids false infeasibility from
+        # master-solution floating-point tolerances.
+        model.storage_price_optimality.add(
+            cleared_surplus - dual_objective <= EPS
+        )
+        model.storage_price_optimality.add(
+            cleared_surplus - dual_objective >= -EPS
+        )
 
 def build_price_feasibility_model(
     orders: Orderbook,
@@ -919,6 +1399,21 @@ def build_price_feasibility_model(
                         for cnec in model.cnecs
                     )
                 )
+
+        # ------------------------------------------------------------------
+        # Storage Order price optimality
+        # ------------------------------------------------------------------
+        #
+        # Storage is continuous in the master model. The following LP dual and
+        # strong-duality conditions ensure that the final zonal prices support
+        # the fixed cleared storage dispatch as profit-maximising.
+        # ------------------------------------------------------------------
+
+    _add_storage_price_optimality_conditions(
+        model=model,
+        orders=orders,
+        master_solution=master_solution,
+    )
 
     model.objective = pyo.Objective(expr=0.0, sense=pyo.minimize)
 
@@ -1364,6 +1859,21 @@ def solve_volume_flow_tiebreak(
         model.x[bid_id].fix(master_solution["selected_x"][bid_id])
         model.xb[bid_id].fix(master_solution["block_acceptance"][bid_id])
 
+    # Keep the storage dispatch used by price feasibility fixed. Otherwise,
+    # the volume tie-break could alter a price-supported storage schedule.
+    if hasattr(model, "storage_bids") and len(model.storage_bids):
+        for bid_id in model.storage_bids:
+            for timestamp in model.T:
+                model.charge[bid_id, timestamp].fix(
+                    master_solution["storage_dispatch"][bid_id]["charge"][timestamp]
+                )
+                model.discharge[bid_id, timestamp].fix(
+                    master_solution["storage_dispatch"][bid_id]["discharge"][timestamp]
+                )
+                model.soc[bid_id, timestamp].fix(
+                    master_solution["storage_dispatch"][bid_id]["soc"][timestamp]
+                )
+
     # Keep the NTC flow state used by the NTC price-feasibility rules.
     if hasattr(model, "ntc_flow"):
         for timestamp in model.T:
@@ -1650,7 +2160,7 @@ class ComplexClearingRole(MarketRole):
         for order in orderbook:
             if order.get("bid_type") is None:
                 order["bid_type"] = "SB"
-            elif order["bid_type"] not in ["SB", "BB", "LB"]:
+            elif order["bid_type"] not in ["SB", "BB", "LB", "SO"]:
                 logger.warning(
                     "Market '%s': invalid bid_type '%s' in order '%s'. "
                     "Using SB.",
@@ -1659,6 +2169,9 @@ class ComplexClearingRole(MarketRole):
                     order.get("bid_id"),
                 )
                 order["bid_type"] = "SB"
+
+            if order["bid_type"] == "SO":
+                _validate_storage_order_static(order)
 
         super().validate_orderbook(orderbook, agent_addr)
 
@@ -1690,6 +2203,19 @@ class ComplexClearingRole(MarketRole):
                     )
                     order["exclusive_group_id"] = None
 
+            if order["bid_type"] == "SO":
+                if order.get("exclusive_group_id") is not None:
+                    raise ValueError(
+                        f"Storage Order '{order['bid_id']}' cannot belong to an "
+                        "exclusive group."
+                    )
+
+                if order.get("parent_bid_id") is not None:
+                    raise ValueError(
+                        f"Storage Order '{order['bid_id']}' cannot be linked to "
+                        "another bid."
+                    )
+                
             node = order.get("node")
 
             if node is None:
@@ -1718,12 +2244,21 @@ class ComplexClearingRole(MarketRole):
         if len(orderbook) == 0:
             return [], [], [], {}
 
-        orderbook.sort(
-            key=itemgetter("start_time", "end_time", "only_hours")
+        snapshots = list(
+            self._validate_market_product_snapshots(market_products)
         )
 
-        snapshots = self._validate_market_product_snapshots(
-            market_products
+        _validate_and_normalise_storage_orders(
+            orders=orderbook,
+            snapshots=snapshots,
+        )
+
+        orderbook.sort(
+            key=lambda order: (
+                str(order.get("start_time", snapshots[0])),
+                str(order.get("end_time", snapshots[-1] + MTU_DURATION)),
+                str(order.get("only_hours", "")),
+            )
         )
 
         fbmc_params = None
@@ -1992,6 +2527,94 @@ def extract_results(
                     demand_volume_dict[order["node"]][timestamp] += (
                         order["accepted_volume"][timestamp]
                     )
+
+        elif order["bid_type"] == "SO":
+            last_timestamp = list(model.T)[-1]
+
+            charge = {
+                timestamp: float(
+                    pyo.value(model.charge[order["bid_id"], timestamp])
+                )
+                for timestamp in model.T
+            }
+            discharge = {
+                timestamp: float(
+                    pyo.value(model.discharge[order["bid_id"], timestamp])
+                )
+                for timestamp in model.T
+            }
+            soc = {
+                timestamp: float(
+                    pyo.value(model.soc[order["bid_id"], timestamp])
+                )
+                for timestamp in model.T
+            }
+            
+            discharged_energy = {
+                timestamp: MTU_DURATION_HOURS * discharge[timestamp]
+                for timestamp in model.T
+            }
+            cycling_cost_eur = {
+                timestamp: (
+                    MTU_DURATION_HOURS
+                    * order["cycling_cost"]
+                    * discharge[timestamp]
+                )
+                for timestamp in model.T
+            }
+            terminal_value_eur = {
+                timestamp: (
+                    order["end_of_day_value"] * soc[timestamp]
+                    if timestamp == last_timestamp
+                    else 0.0
+                )
+                for timestamp in model.T
+            }
+            storage_surplus_eur = {
+                timestamp: (
+                    MTU_DURATION_HOURS
+                    * market_clearing_prices[order["node"]][timestamp]
+                    * (discharge[timestamp] - charge[timestamp])
+                    - cycling_cost_eur[timestamp]
+                    + terminal_value_eur[timestamp]
+                )
+                for timestamp in model.T
+            }
+
+            order["charge"] = charge
+            order["discharge"] = discharge
+            order["soc"] = soc
+            order["discharged_energy"] = discharged_energy
+            order["cycling_cost_eur"] = cycling_cost_eur
+            order["terminal_value_eur"] = terminal_value_eur
+            order["storage_surplus_eur"] = storage_surplus_eur
+            order["total_discharged_energy"] = sum(discharged_energy.values())
+            order["total_cycling_cost_eur"] = sum(cycling_cost_eur.values())
+            order["total_terminal_value_eur"] = sum(
+                terminal_value_eur.values()
+            )
+            order["total_storage_surplus_eur"] = sum(
+                storage_surplus_eur.values()
+            )
+
+            order["accepted_volume"] = {
+                timestamp: discharge[timestamp] - charge[timestamp]
+                for timestamp in model.T
+            }
+            order["accepted_price"] = market_clearing_prices[
+                order["node"]
+            ].copy()
+
+            for timestamp in model.T:
+                supply_volume_dict[order["node"]][timestamp] += (
+                    discharge[timestamp]
+                )
+                demand_volume_dict[order["node"]][timestamp] -= (
+                    charge[timestamp]
+                )
+
+            accepted_orders.append(order)
+            continue
 
         if acceptance > 0:
             accepted_orders.append(order)
