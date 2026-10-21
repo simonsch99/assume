@@ -27,6 +27,8 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
+from math import isfinite
+from typing import Iterator
 
 import pandas as pd
 import pypsa
@@ -52,129 +54,104 @@ MTU_DURATION_HOURS = 0.25
 # ---------------------------------------------------------------------------
 
 
+def _non_comment_csv_lines(path: str | Path) -> Iterator[str]:
+    """Yield non-empty, non-comment CSV lines."""
+    with Path(path).open(newline="") as file:
+        for line in file:
+            if line.strip() and not line.lstrip().startswith("#"):
+                yield line
+
+
 class QuarterHourlyOrderReader:
     """
-    Read simple 15-minute orders from a comma-separated EUPHEMIA-like CSV.
+    Read simple orders from layout_simple_orders.csv.
 
-    Expected row layout, without header:
+    Required header columns:
+    Date, Week, Week Day, Hour, Quarter hour, Price, Volume, Sale/Purchase,
+    bidding_zone
 
-        0: bid ID
-        1: order type
-        2: optional portfolio ID
-        3: delivery interval, 1..96
-        4: price
-        5: quantity, always positive
-        6: Purchase or Sell
-        7: bidding zone
-
-    Delivery intervals are mapped as follows:
-
-        interval 1  -> 00:00
-        interval 2  -> 00:15
-        ...
-        interval 96 -> 23:45
-
-    CSV convention:
-        Purchase -> positive quantity in CSV -> negative ASSUME volume
-        Sell     -> positive quantity in CSV -> positive ASSUME volume
+    ``bidding_zone`` is optional per row, but must be the trailing layout
+    column. An empty zone is resolved by ClearingTestTool.default_node.
     """
 
-    def read(
-        self,
-        path: str | Path,
-    ) -> list[dict]:
-        """Read simple 15-minute orders from a CSV file."""
+    REQUIRED_COLUMNS = {
+        "Date",
+        "Week",
+        "Week Day",
+        "Hour",
+        "Quarter hour",
+        "Price",
+        "Volume",
+        "Sale/Purchase",
+        "bidding_zone",
+    }
+
+    def read(self, path: str | Path) -> list[dict]:
+        reader = csv.DictReader(_non_comment_csv_lines(path))
+        reader.fieldnames = [
+            (field or "").strip()
+            for field in (reader.fieldnames or [])
+        ]
+
+        missing = self.REQUIRED_COLUMNS.difference(reader.fieldnames)
+
+        if missing:
+            raise ValueError(
+                f"Simple-order CSV is missing required columns: "
+                f"{sorted(missing)}."
+            )
+
         orders = []
 
-        with Path(path).open(newline="") as file:
-            reader = csv.reader(file)
+        for line_number, row in enumerate(reader, start=2):
+            try:
+                hour = int(row["Hour"]) - 1
+                quarter = int(row["Quarter hour"]) - 1
+                interval = hour * 4 + quarter
+                side = (row["Sale/Purchase"] or "").strip()
 
-            for line_number, row in enumerate(reader, start=1):
-                if len(row) < 8:
-                    logger.warning(
-                        "Skipping 15-minute order row %s: expected at "
-                        "least 8 columns.",
-                        line_number,
+                if not 0 <= interval < 96:
+                    raise ValueError(
+                        "Hour and Quarter hour must identify an MTU in 1..96."
                     )
-                    continue
-
-                side = row[6].strip()
 
                 if side not in {"Purchase", "Sell"}:
-                    continue
-
-                try:
-                    interval = int(row[3]) - 1
-
-                    if not 0 <= interval < 96:
-                        raise ValueError(
-                            "delivery interval must be in 1..96, "
-                            f"got {interval + 1}"
-                        )
-
-                    orders.append(
-                        {
-                            "raw_id": (
-                                row[0].strip()
-                                or f"quarter_hourly_{line_number}"
-                            ),
-                            "side": (
-                                "BUY"
-                                if side == "Purchase"
-                                else "SELL"
-                            ),
-                            "price": float(row[4]),
-                            "quantity": float(row[5]),
-                            "interval": interval,
-                            "bidding_zone": row[7].strip() or "node0",
-                        }
+                    raise ValueError(
+                        "Sale/Purchase must be either 'Purchase' or 'Sell'."
                     )
 
-                except ValueError as error:
-                    logger.warning(
-                        "Skipping 15-minute order row %s: %s",
-                        line_number,
-                        error,
-                    )
+                orders.append(
+                    {
+                        "raw_id": f"simple_{line_number}",
+                        "side": "BUY" if side == "Purchase" else "SELL",
+                        "price": float(row["Price"]),
+                        "quantity": float(row["Volume"]),
+                        "interval": interval,
+                        "bidding_zone": (
+                            row.get("bidding_zone") or ""
+                        ).strip(),
+                    }
+                )
+            except (TypeError, ValueError) as error:
+                logger.warning(
+                    "Skipping simple-order row %s: %s",
+                    line_number,
+                    error,
+                )
 
-        logger.info(
-            "Read %s 15-minute simple orders from %s.",
-            len(orders),
-            path,
-        )
+        logger.info("Read %s simple orders from %s.", len(orders), path)
         return orders
 
 
 class BlockOrderReader:
     """
-    Read block orders from a semicolon-separated EUPHEMIA-like CSV.
+    Read block orders from layout_block_orders.csv.
 
-    Expected row layout, without header:
-
-        0: BB marker
-        1: block ID
-        2: block type:
-             C01 = ordinary block
-             C02 = linked block
-             C04 = exclusive block
-        3: parent bid ID for C02 or exclusive-group ID for C04
-        5: price
-        6..101: quantities for delivery intervals 1..96
-        102: minimum acceptance ratio
-        104: bidding zone
-
-    CSV convention:
-        The input uses the inverse ASSUME volume sign convention.
-
-        negative CSV quantity -> positive ASSUME supply volume
-        positive CSV quantity -> negative ASSUME demand volume
+    The trailing field at index 104 is ``bidding_zone``. An empty zone is
+    resolved by ClearingTestTool.default_node.
     """
 
-    def read(
-        self,
-        path: str | Path,
-    ) -> list[dict]:
-        """Read 15-minute block orders from a CSV file."""
+    def read(self, path: str | Path) -> list[dict]:
         blocks = []
 
         with Path(path).open(newline="") as file:
@@ -184,18 +161,8 @@ class BlockOrderReader:
                 if not row or row[0].strip() != "BB":
                     continue
 
-                if len(row) < 105:
-                    logger.warning(
-                        "Skipping block row %s: expected at least "
-                        "105 columns, got %s.",
-                        line_number,
-                        len(row),
-                    )
-                    continue
-
                 try:
                     blocks.append(self._read_line(row))
-
                 except (ValueError, IndexError) as error:
                     logger.warning(
                         "Skipping block row %s: %s",
@@ -203,44 +170,175 @@ class BlockOrderReader:
                         error,
                     )
 
-        logger.info(
-            "Read %s 15-minute block orders from %s.",
-            len(blocks),
-            path,
-        )
+        logger.info("Read %s block orders from %s.", len(blocks), path)
         return blocks
 
     @staticmethod
-    def _read_line(
-        row: list[str],
-    ) -> dict:
-        """Parse one 96-interval block-order CSV row."""
+    def _read_line(row: list[str]) -> dict:
         if len(row) < 105:
             raise ValueError(
-                "Block rows must contain at least 105 columns."
+                "Block rows must contain 105 columns, including "
+                "trailing bidding_zone."
             )
-
-        # Convert EUPHEMIA-style sign convention to ASSUME convention.
-        quantities = [
-            -float(row[6 + interval])
-            for interval in range(96)
-        ]
-
-        minimum_acceptance_ratio = (
-            float(row[102])
-            if row[102].strip()
-            else None
-        )
 
         return {
             "raw_id": row[1].strip(),
             "type": row[2].strip(),
             "special_id": row[3].strip() or None,
             "price": float(row[5]),
-            "intervals": quantities,
-            "acc_ratio": minimum_acceptance_ratio,
-            "bidding_zone": row[104].strip() or "node0",
+            "intervals": [-float(row[6 + interval]) for interval in range(96)],
+            "acc_ratio": float(row[102]) if row[102].strip() else None,
+            "bidding_zone": row[104].strip(),
         }
+
+
+class StorageOrderReader:
+    """
+    Read wide-format storage orders.
+
+    One row represents one storage order. Mandatory time-series columns are
+    max_energy_01..96, max_input_power_01..96, and max_output_power_01..96.
+    The min_energy_01..96 group is optional as a whole.
+    """
+
+    STATIC_COLUMNS = {
+        "bid_id",
+        "bidding_zone",
+        "starting_energy",
+        "efficiency",
+        "cycling_cost",
+        "end_of_day_value",
+    }
+    MANDATORY_SERIES = (
+        "max_energy",
+        "max_input_power",
+        "max_output_power",
+    )
+
+    @staticmethod
+    def _series_columns(prefix: str) -> list[str]:
+        return [f"{prefix}_{interval:02d}" for interval in range(1, 97)]
+
+    @staticmethod
+    def _numeric(value, field: str, bid_id: str) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Storage Order '{bid_id}' field '{field}' must be numeric."
+            ) from exc
+
+        if not isfinite(number):
+            raise ValueError(
+                f"Storage Order '{bid_id}' field '{field}' must be finite."
+            )
+
+        return number
+
+    def read(self, path: str | Path) -> list[dict]:
+        reader = csv.DictReader(_non_comment_csv_lines(path))
+        reader.fieldnames = [
+            (field or "").strip()
+            for field in (reader.fieldnames or [])
+        ]
+        columns = set(reader.fieldnames)
+
+        if len(columns) != len(reader.fieldnames):
+            raise ValueError("Storage-order CSV contains duplicate column names.")
+
+        required = set(self.STATIC_COLUMNS)
+
+        for prefix in self.MANDATORY_SERIES:
+            required.update(self._series_columns(prefix))
+
+        missing = required.difference(columns)
+
+        if missing:
+            raise ValueError(
+                "Storage-order CSV is missing required columns: "
+                f"{sorted(missing)}."
+            )
+
+        min_columns = self._series_columns("min_energy")
+        present_min_columns = [column for column in min_columns if column in columns]
+
+        if present_min_columns and len(present_min_columns) != 96:
+            missing_min = sorted(set(min_columns).difference(columns))
+            raise ValueError(
+                "Storage-order CSV has an incomplete optional min_energy "
+                f"series. Missing columns: {missing_min}."
+            )
+
+        orders = []
+        bid_ids = set()
+
+        for line_number, row in enumerate(reader, start=2):
+            bid_id = (row.get("bid_id") or "").strip()
+
+            if not bid_id:
+                raise ValueError(
+                    f"Storage-order CSV row {line_number} has an empty bid_id."
+                )
+
+            if bid_id in bid_ids:
+                raise ValueError(
+                    f"Storage-order CSV contains duplicate bid_id '{bid_id}'."
+                )
+
+            bid_ids.add(bid_id)
+
+            static_values = {
+                field: self._numeric(row.get(field), field, bid_id)
+                for field in (
+                    "starting_energy",
+                    "efficiency",
+                    "cycling_cost",
+                    "end_of_day_value",
+                )
+            }
+
+            parsed_series = {}
+
+            for prefix in self.MANDATORY_SERIES:
+                values = [
+                    self._numeric(row.get(column), column, bid_id)
+                    for column in self._series_columns(prefix)
+                ]
+
+                if any(value < 0 for value in values):
+                    raise ValueError(
+                        f"Storage Order '{bid_id}' series '{prefix}' must "
+                        "contain only non-negative values."
+                    )
+
+                parsed_series[prefix] = values
+
+            if present_min_columns:
+                min_energy = [
+                    self._numeric(row.get(column), column, bid_id)
+                    for column in min_columns
+                ]
+
+                if any(value < 0 for value in min_energy):
+                    raise ValueError(
+                        f"Storage Order '{bid_id}' series 'min_energy' must "
+                        "contain only non-negative values."
+                    )
+            else:
+                min_energy = [0.0] * 96
+
+            orders.append(
+                {
+                    "bid_id": bid_id,
+                    "bidding_zone": (row.get("bidding_zone") or "").strip(),
+                    **static_values,
+                    **parsed_series,
+                    "min_energy": min_energy,
+                }
+            )
+
+        logger.info("Read %s storage orders from %s.", len(orders), path)
+        return orders
 
 
 # ---------------------------------------------------------------------------
@@ -388,75 +486,66 @@ class ClearingTestTool:
         delivery_date: datetime,
         quarter_hourly_csv: str | Path | None = None,
         block_csv: str | Path | None = None,
+        storage_csv: str | Path | None = None,
         default_node: str = "node0",
     ) -> Orderbook:
-        """
-        Read 15-minute simple and/or block-order files.
-
-        The generated delivery day always contains exactly 96 fixed
-        15-minute market products, independently of whether bids exist
-        in every interval.
-        """
-        if quarter_hourly_csv is None and block_csv is None:
+        """Read simple, block, and/or wide-format storage-order files."""
+        if (
+            quarter_hourly_csv is None
+            and block_csv is None
+            and storage_csv is None
+        ):
             raise ValueError(
-                "At least one of quarter_hourly_csv or block_csv must "
-                "be supplied."
+                "At least one of quarter_hourly_csv, block_csv, or storage_csv "
+                "must be supplied."
             )
 
         self.delivery_date = (
-            pd.Timestamp(delivery_date)
-            .normalize()
-            .to_pydatetime()
+            pd.Timestamp(delivery_date).normalize().to_pydatetime()
         )
-
         orderbook: Orderbook = []
 
         if quarter_hourly_csv is not None:
-            quarter_hourly_orders = QuarterHourlyOrderReader().read(
-                quarter_hourly_csv
-            )
-
             orderbook.extend(
                 self._quarter_hourly_to_orderbook(
-                    quarter_hourly_orders,
+                    QuarterHourlyOrderReader().read(quarter_hourly_csv),
                     default_node,
                 )
             )
 
         if block_csv is not None:
-            block_orders = BlockOrderReader().read(block_csv)
-
             orderbook.extend(
                 self._blocks_to_orderbook(
-                    block_orders,
+                    BlockOrderReader().read(block_csv),
+                    default_node,
+                )
+            )
+
+        if storage_csv is not None:
+            orderbook.extend(
+                self._storage_to_orderbook(
+                    StorageOrderReader().read(storage_csv),
                     default_node,
                 )
             )
 
         if not orderbook:
-            raise ValueError(
-                "No valid orders could be read from the input files."
-            )
+            raise ValueError("No valid orders could be read from the input files.")
 
+        self._validate_unique_bid_ids(orderbook)
         self._validate_linked_block_parents(orderbook)
 
         self.orderbook = orderbook
         self.submitted_order_count = len(orderbook)
         self.market_products = self._build_market_products()
-
         self._validate_network_market_product_snapshots()
 
         logger.info(
-            "Built orderbook with %s orders: %s simple and %s block orders.",
+            "Built orderbook with %s orders: %s simple, %s block, %s storage.",
             len(orderbook),
-            sum(
-                order["bid_type"] == "SB"
-                for order in orderbook
-            ),
-            sum(
-                order["bid_type"] in {"BB", "LB"}
-                for order in orderbook
-            ),
+            sum(order["bid_type"] == "SB" for order in orderbook),
+            sum(order["bid_type"] in {"BB", "LB"} for order in orderbook),
+            sum(order["bid_type"] == "SO" for order in orderbook),
         )
 
         return self.orderbook
@@ -589,6 +678,66 @@ class ClearingTestTool:
 
         return orderbook
 
+    def _storage_to_orderbook(
+        self,
+        storage_orders: list[dict],
+        default_node: str,
+    ) -> Orderbook:
+        """Convert wide storage rows to SO orders with timestamp mappings."""
+        timestamps = [self._interval_start(interval) for interval in range(96)]
+        start_time = timestamps[0]
+        end_time = timestamps[-1] + MTU_DURATION
+        orderbook: Orderbook = []
+
+        for storage in storage_orders:
+            node = storage["bidding_zone"] or default_node
+
+            orderbook.append(
+                {
+                    "bid_id": storage["bid_id"],
+                    "agent_addr": (f"agent_{node}", "test"),
+                    "bid_type": "SO",
+                    "node": node,
+                    "price": 0.0,
+                    "volume": {},
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "only_hours": None,
+                    "parent_bid_id": None,
+                    "exclusive_group_id": None,
+                    "starting_energy": storage["starting_energy"],
+                    "efficiency": storage["efficiency"],
+                    "cycling_cost": storage["cycling_cost"],
+                    "end_of_day_value": storage["end_of_day_value"],
+                    "max_energy": dict(zip(timestamps, storage["max_energy"])),
+                    "min_energy": dict(zip(timestamps, storage["min_energy"])),
+                    "max_input_power": dict(
+                        zip(timestamps, storage["max_input_power"])
+                    ),
+                    "max_output_power": dict(
+                        zip(timestamps, storage["max_output_power"])
+                    ),
+                }
+            )
+
+        return orderbook
+
+
+    @staticmethod
+    def _validate_unique_bid_ids(orderbook: Orderbook) -> None:
+        """Reject duplicate IDs across simple, block, and storage input files."""
+        bid_ids = [order["bid_id"] for order in orderbook]
+        duplicates = sorted(
+            bid_id
+            for bid_id in set(bid_ids)
+            if bid_ids.count(bid_id) > 1
+        )
+
+        if duplicates:
+            raise ValueError(
+                f"Duplicate bid_id values across input files: {duplicates}."
+            )
+        
     @staticmethod
     def _validate_linked_block_parents(
         orderbook: Orderbook,
@@ -718,6 +867,14 @@ class ClearingTestTool:
                 "parent_bid_id",
                 "exclusive_group_id",
                 "node",
+                "starting_energy",
+                "efficiency",
+                "cycling_cost",
+                "end_of_day_value",
+                "max_energy",
+                "min_energy",
+                "max_input_power",
+                "max_output_power",
             ],
             "param_dict": param_dict,
         }
@@ -796,9 +953,10 @@ class ClearingTestTool:
         }
 
         logger.info(
-            "Clearing completed: %s accepted and %s rejected orders.",
+            "Clearing completed: %s accepted, %s rejected, %s storage orders.",
             len(accepted),
             len(rejected),
+            sum(order["bid_type"] == "SO" for order in working_orderbook),
         )
 
         return self.results
@@ -826,32 +984,42 @@ class ClearingTestTool:
         self,
         orders: Orderbook,
     ) -> pd.DataFrame:
-        """Convert accepted/rejected orders to a DataFrame."""
+        """Convert accepted/rejected orders, including storage fields, to CSV."""
         rows = []
 
         for order in orders:
+            accepted_volume = order.get("accepted_volume", 0.0)
+
             rows.append(
                 {
-                    "bid_id": order["bid_id"],
-                    "agent_id": order["agent_addr"][0],
-                    "bid_type": order["bid_type"],
-                    "price": order["price"],
-                    "volume": self._serialize(order["volume"]),
+                    "bid_id": order.get("bid_id"),
+                    "agent_id": order.get("agent_addr", ("", ""))[0],
+                    "bid_type": order.get("bid_type"),
+                    "price": order.get("price"),
+                    "volume": self._serialize(order.get("volume")),
                     "node": order.get("node"),
-                    "start_time": order["start_time"],
-                    "end_time": order["end_time"],
-                    "min_acceptance_ratio": order.get(
-                        "min_acceptance_ratio"
-                    ),
+                    "start_time": order.get("start_time"),
+                    "end_time": order.get("end_time"),
+                    "min_acceptance_ratio": order.get("min_acceptance_ratio"),
                     "parent_bid_id": order.get("parent_bid_id"),
-                    "exclusive_group_id": order.get(
-                        "exclusive_group_id"
-                    ),
-                    "accepted_volume": self._serialize(
-                        order.get("accepted_volume", 0.0)
-                    ),
+                    "exclusive_group_id": order.get("exclusive_group_id"),
+                    "starting_energy": order.get("starting_energy"),
+                    "efficiency": order.get("efficiency"),
+                    "cycling_cost": order.get("cycling_cost"),
+                    "end_of_day_value": order.get("end_of_day_value"),
+                    "accepted_volume": self._serialize(accepted_volume),
+                    "accepted_net_volume": self._serialize(accepted_volume),
                     "accepted_price": self._serialize(
                         order.get("accepted_price", 0.0)
+                    ),
+                    "charge": self._serialize(order.get("charge")),
+                    "discharge": self._serialize(order.get("discharge")),
+                    "soc": self._serialize(order.get("soc")),
+                    "storage_surplus_eur": self._serialize(
+                        order.get("storage_surplus_eur")
+                    ),
+                    "total_storage_surplus_eur": order.get(
+                        "total_storage_surplus_eur"
                     ),
                 }
             )
@@ -911,6 +1079,18 @@ class ClearingTestTool:
         print(f"  Submitted: {self.submitted_order_count}")
         print(f"  Accepted:  {len(self.results['accepted_orders'])}")
         print(f"  Rejected:  {len(self.results['rejected_orders'])}")
+
+        submitted_storage = sum(
+            order["bid_type"] == "SO"
+            for order in self.orderbook
+        )
+        accepted_storage = sum(
+            order["bid_type"] == "SO"
+            for order in self.results["accepted_orders"]
+        )
+
+        print(f"  Storage submitted: {submitted_storage}")
+        print(f"  Storage accepted:  {accepted_storage}")
 
         market_meta = self.results.get("market_meta", [])
 
