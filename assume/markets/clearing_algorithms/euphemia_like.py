@@ -1332,7 +1332,9 @@ def build_price_feasibility_model(
             from_price = model.price[timestamp, from_zone]
             to_price = model.price[timestamp, to_zone]
 
-            if lower + EPS < flow < upper - EPS:
+            if upper - lower <= EPS:
+                pass  # zero-capacity line couples no prices
+            elif lower + EPS < flow < upper - EPS:
                 model.price_constraints.add(from_price == to_price)
             else:
                 if flow >= upper - EPS:
@@ -1400,14 +1402,14 @@ def build_price_feasibility_model(
                     )
                 )
 
-        # ------------------------------------------------------------------
-        # Storage Order price optimality
-        # ------------------------------------------------------------------
-        #
-        # Storage is continuous in the master model. The following LP dual and
-        # strong-duality conditions ensure that the final zonal prices support
-        # the fixed cleared storage dispatch as profit-maximising.
-        # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Storage Order price optimality
+    # ------------------------------------------------------------------
+    #
+    # Storage is continuous in the master model. The following LP dual and
+    # strong-duality conditions ensure that the final zonal prices support
+    # the fixed cleared storage dispatch as profit-maximising.
+    # ------------------------------------------------------------------
 
     _add_storage_price_optimality_conditions(
         model=model,
@@ -1530,7 +1532,7 @@ def solve_master_with_price_cuts(
             + sum(master_model.x[bid_id] for bid_id in rejected_ids)
             >= 1
         )
-        cuts_added += 1 # TODO Check cut logic
+        cuts_added += 1
 
 def _get_directly_fixed_prices(
     orders: Orderbook,
