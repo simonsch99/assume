@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import pytest
 
+import pandas as pd
+import numpy as np  
+
 from .test_euphemia_like_tools import (
     EPS,
     PRICE_TOL,
@@ -43,6 +46,13 @@ from .test_euphemia_like_tools import (
     precompute_fbmc_clearing_input,
     product_timestamps,
     requires_solver,
+    require_linopy_solver,
+)
+
+from assume.common.fbmc_utils import (
+    calculate_lodf,
+    calculate_nodal_ptdf,
+    precompute_fbmc_parameters,
 )
 
 ZONE_A = "ZA"
@@ -241,7 +251,7 @@ def test_zero_ntc_capacity_isolates_zones():
 # ---------------------------------------------------------------------------
 
 
-def _run_fbmc_case(s_nom: float):
+def _run_fbmc_case(s_nom: float, reverse: bool = False): 
     """
     Clear a one-MTU, two-zone flow-based scenario.
 
@@ -263,7 +273,7 @@ def _run_fbmc_case(s_nom: float):
             "log_flows": True,
         },
     )
-    orders = _ntc_orders(timestamp)
+    orders = _ntc_orders(timestamp, reverse=reverse)
 
     result = clear_market(config, orders, products)
 
@@ -386,3 +396,114 @@ def test_ram_sensitivity_reduces_exchange_and_increases_separation():
     )
 
     assert tight_separation > relaxed_separation + PRICE_TOL
+
+# ---------------------------------------------------------------------------
+# FBMC sign-convention tests
+# ---------------------------------------------------------------------------
+
+
+def _three_node_network(timestamp):
+    """Three-node meshed network with fixed balanced injections."""
+    pypsa = pytest.importorskip("pypsa")
+    n = pypsa.Network()
+    n.set_snapshots(pd.DatetimeIndex([timestamp]))
+
+    for bus, zone in (("a", ZONE_A), ("b", ZONE_A), ("c", ZONE_B)):
+        n.add("Bus", bus)
+        n.buses.at[bus, "zone_id"] = zone
+
+    for line, bus0, bus1 in (("ab", "a", "b"), ("bc", "b", "c"), ("ca", "c", "a")):
+        n.add("Line", line, bus0=bus0, bus1=bus1, x=0.1, s_nom=1000.0)
+
+    n.add("Generator", "gen_a", bus="a", p_nom=300.0, p_set=300.0)
+    n.add("Load", "load_b", bus="b", p_set=100.0)
+    n.add("Load", "load_c", bus="c", p_set=200.0)
+    return n
+
+
+@requires_solver
+def test_nodal_ptdf_reconstructs_three_node_flows():
+    """PTDF injections reproduce PyPSA p0 flows on a meshed three-node grid."""
+    timestamp = product_timestamps(make_products(1))[0]
+    n = _three_node_network(timestamp)
+    n.lpf()
+
+    injections = pd.Series({"a": 300.0, "b": -100.0, "c": -200.0})
+    expected = n.lines_t.p0.loc[timestamp]
+    actual = calculate_nodal_ptdf(n).dot(injections).reindex(expected.index)
+
+    np.testing.assert_allclose(actual.to_numpy(), expected.to_numpy(), atol=1e-6)
+
+
+@requires_solver
+def test_fbmc_positive_and_negative_trade_bind_opposite_cnecs():
+    """ZA export binds the positive CNEC; ZA import binds the negative CNEC."""
+    for reverse, expected_export, expected_direction in (
+        (False, 90.0, "positive"),
+        (True, -90.0, "negative"),
+    ):
+        result, clearing_input, timestamp = _run_fbmc_case(100.0, reverse=reverse)
+        records = fbmc_cnec_utilisation(
+            clearing_input, result["flows"], [timestamp]
+        )
+        binding = min(records, key=lambda record: abs(record["slack"]))
+
+        require_linopy_solver()
+        raw = precompute_fbmc_parameters(
+            network=make_two_zone_network([timestamp], s_nom=100.0),
+            flowbased_region=[ZONE_A, ZONE_B],
+            zone_column="zone_id",
+            snapshots=pd.DatetimeIndex([timestamp]),
+        )
+
+        assert get_fb_net_export(
+            result["flows"], timestamp, ZONE_A
+        ) == pytest.approx(expected_export, abs=1e-3)
+        assert abs(binding["slack"]) <= 1e-3
+        assert raw["cnec_info"].at[binding["cnec"], "direction"] == expected_direction
+
+
+@requires_solver
+def test_d2_reference_flow_decomposition():
+    """D-2 CNEC flow equals reference flow plus zPTDF-weighted D-2 net position."""
+    require_linopy_solver()
+    timestamp = product_timestamps(make_products(1))[0]
+    raw = precompute_fbmc_parameters(
+        network=make_two_zone_network([timestamp], s_nom=1000.0),
+        flowbased_region=[ZONE_A, ZONE_B],
+        zone_column="zone_id",
+        snapshots=pd.DatetimeIndex([timestamp]),
+    )
+
+    np_d2 = raw["fb_reference_net_positions"].loc[timestamp]
+    reconstructed = raw["reference_flow_without_market"].loc[timestamp] + (
+        raw["zonal_ptdf"][timestamp].dot(np_d2)
+    )
+    expected = raw["reference_flows"].loc[timestamp].reindex(reconstructed.index)
+
+    np.testing.assert_allclose(
+        reconstructed.to_numpy(),
+        expected.to_numpy(),
+        atol=1e-6,
+    )
+
+
+@requires_solver
+def test_lodf_matches_explicit_n1_load_flow():
+    """LODF post-contingency flow matches an explicit DC load flow after outage."""
+    timestamp = product_timestamps(make_products(1))[0]
+    n = _three_node_network(timestamp)
+    n.lpf()
+
+    ptdf = calculate_nodal_ptdf(n)
+    lodf = calculate_lodf(n, ptdf)
+    base_flow = n.lines_t.p0.loc[timestamp]
+
+    outaged = n.copy()
+    outaged.remove("Line", "ab")
+    outaged.lpf()
+
+    predicted = base_flow["bc"] + lodf.at["bc", "ab"] * base_flow["ab"]
+    actual = outaged.lines_t.p0.at[timestamp, "bc"]
+
+    assert predicted == pytest.approx(actual, abs=1e-6)

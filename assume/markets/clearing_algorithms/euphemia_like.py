@@ -28,6 +28,8 @@ Prices remain in EUR/MWh. Welfare, block surplus, and reported energy use
 the fixed 0.25-hour MTU duration to convert MW to MWh.
 """
 
+import os
+import tempfile
 import logging
 from collections import defaultdict
 from datetime import timedelta
@@ -41,7 +43,7 @@ import pandas as pd
 import pyomo.environ as pyo
 import pypsa
 from mango import AgentAddress
-from pyomo.opt import OptSolver, SolverFactory
+from pyomo.opt import OptSolver, SolverFactory, ProblemFormat
 
 from assume.common.fbmc_utils import (
     precompute_fbmc_parameters,
@@ -1228,7 +1230,17 @@ def build_price_feasibility_model(
         domain=pyo.Reals,
         bounds=(price_floor, price_cap),
     )
+    # Non-block pricing constraints remain separate from block-related surplus
+    # constraints so that local price-feasibility conflicts can be classified.
     model.price_constraints = pyo.ConstraintList()
+    model.block_surplus_constraints = pyo.ConstraintList()
+    model.linked_family_surplus_constraints = pyo.ConstraintList()
+
+    # Explicit ConstraintData -> responsible accepted block IDs mappings.
+    # They are used by both native Gurobi IIS extraction and the deletion-based
+    # conflict fallback.
+    model.block_surplus_constraint_to_bid = {}
+    model.linked_family_constraint_to_bids = {}
 
     # ------------------------------------------------------------------
     # Simple bids
@@ -1267,6 +1279,12 @@ def build_price_feasibility_model(
     # ------------------------------------------------------------------
     # Block and linked-block surplus
     # ------------------------------------------------------------------
+    #
+    # These constraints are kept separate and explicitly mapped to their
+    # responsible accepted blocks. This supports a simplified EUPHEMIA-like
+    # local-cut heuristic inspired by Sections 7.4-7.5 and Annex B of the
+    # public EUPHEMIA description.
+    # ------------------------------------------------------------------
 
     block_orders = {
         order["bid_id"]: order
@@ -1284,7 +1302,7 @@ def build_price_feasibility_model(
     block_surplus = {}
 
     for bid_id, order in block_orders.items():
-        acceptance = master_solution["block_acceptance"][bid_id]
+        acceptance = master_solution["block_acceptance"].get(bid_id, 0.0)
 
         if acceptance <= EPS:
             continue
@@ -1300,21 +1318,48 @@ def build_price_feasibility_model(
             for timestamp, volume in order["volume"].items()
         )
 
-    for bid_id, own_surplus in block_surplus.items():
-        accepted_children = [
-            child_bid_id
-            for child_bid_id in children_by_parent.get(bid_id, [])
-            if child_bid_id in block_surplus
-        ]
+    def accepted_descendants(root_bid_id: str) -> list[str]:
+        """Return all accepted descendants of one linked block."""
+        descendants = []
+        stack = list(children_by_parent.get(root_bid_id, []))
+        visited = set()
 
-        model.price_constraints.add(
-            own_surplus
-            + sum(
-                block_surplus[child_bid_id]
-                for child_bid_id in accepted_children
+        while stack:
+            child_bid_id = stack.pop()
+
+            if child_bid_id in visited:
+                continue
+
+            visited.add(child_bid_id)
+            stack.extend(children_by_parent.get(child_bid_id, []))
+
+            if child_bid_id in block_surplus:
+                descendants.append(child_bid_id)
+
+        return descendants
+
+    for bid_id, own_surplus in block_surplus.items():
+        descendants = accepted_descendants(bid_id)
+
+        if descendants:
+            family_bid_ids = [bid_id, *descendants]
+            constraint_data = (
+                model.linked_family_surplus_constraints.add(
+                    sum(
+                        block_surplus[family_bid_id]
+                        for family_bid_id in family_bid_ids
+                    )
+                    >= -EPS
+                )
             )
-            >= -EPS
-        )
+            model.linked_family_constraint_to_bids[constraint_data] = (
+                frozenset(family_bid_ids)
+            )
+        else:
+            constraint_data = model.block_surplus_constraints.add(
+                own_surplus >= -EPS
+            )
+            model.block_surplus_constraint_to_bid[constraint_data] = bid_id
 
     # ------------------------------------------------------------------
     # NTC price-flow consistency
@@ -1421,6 +1466,354 @@ def build_price_feasibility_model(
 
     return model
 
+def _price_conflict_constraint_mapping(
+    price_model: pyo.ConcreteModel,
+) -> dict:
+    """Map each block-related price constraint to accepted block IDs."""
+    mapping = {
+        constraint: frozenset([bid_id])
+        for constraint, bid_id in (
+            price_model.block_surplus_constraint_to_bid.items()
+        )
+    }
+    mapping.update(price_model.linked_family_constraint_to_bids)
+    return mapping
+
+
+def _solve_price_model(
+    solver: OptSolver,
+    model: pyo.ConcreteModel,
+    solver_options: dict,
+):
+    """Solve one price model without interpreting its termination status."""
+    return solver.solve(model, options=solver_options)
+
+
+def _diagnostic_prices_without_block_surplus(
+    price_model: pyo.ConcreteModel,
+    solver: OptSolver,
+    solver_options: dict,
+) -> dict[tuple, float]:
+    """
+    Solve the relaxed diagnostic pricing LP.
+
+    Only block and linked-family surplus constraints are deactivated. Simple
+    bids, NTC, FBMC, storage optimality, and price bounds remain active.
+    """
+    conflict_mapping = _price_conflict_constraint_mapping(price_model)
+    constraints = list(conflict_mapping)
+
+    for constraint in constraints:
+        constraint.deactivate()
+
+    try:
+        results = _solve_price_model(
+            solver=solver,
+            model=price_model,
+            solver_options=solver_options,
+        )
+
+        if not _result_has_solution(results):
+            raise RuntimeError(
+                "Pricing infeasibility cannot be attributed to block or "
+                "linked-family surplus constraints: the diagnostic pricing "
+                "LP remains infeasible after all such constraints are "
+                "deactivated. The simplified local-cut heuristic cannot "
+                "classify this infeasibility."
+            )
+
+        return {
+            (timestamp, zone): float(
+                pyo.value(price_model.price[timestamp, zone])
+            )
+            for timestamp in price_model.T
+            for zone in price_model.zones
+        }
+    finally:
+        for constraint in constraints:
+            constraint.activate()
+
+
+def _try_gurobi_iis_conflict(
+    price_model: pyo.ConcreteModel,
+) -> set[str] | None:
+    """
+    Try native Gurobi computeIIS through Pyomo's symbolic LP integration.
+
+    Returning None means IIS extraction is unavailable and the caller should
+    use deletion-based conflict reduction.
+    """
+    try:
+        import gurobipy as gp
+    except ImportError:
+        logger.info(
+            "Gurobi IIS extraction is unavailable because gurobipy could "
+            "not be imported; using deletion-based conflict reduction."
+        )
+        return None
+
+    conflict_mapping = _price_conflict_constraint_mapping(price_model)
+
+    if not conflict_mapping:
+        return set()
+
+    temporary_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".lp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = temporary_file.name
+
+        _, symbol_map_id = price_model.write(
+            temporary_path,
+            format=ProblemFormat.cpxlp,
+            io_options={"symbolic_solver_labels": True},
+        )
+        symbol_map = price_model.solutions.symbol_map[symbol_map_id]
+
+        symbol_to_bid_ids = {}
+
+        for constraint, bid_ids in conflict_mapping.items():
+            symbol = symbol_map.getSymbol(constraint)
+            symbol_to_bid_ids[symbol] = bid_ids
+
+        gurobi_model = gp.read(temporary_path)
+        gurobi_model.Params.OutputFlag = 0
+        gurobi_model.computeIIS()
+
+        conflict_bid_ids = set()
+
+        for gurobi_constraint in gurobi_model.getConstrs():
+            if not gurobi_constraint.IISConstr:
+                continue
+
+            conflict_bid_ids.update(
+                symbol_to_bid_ids.get(
+                    gurobi_constraint.ConstrName,
+                    (),
+                )
+            )
+
+        if not conflict_bid_ids:
+            logger.warning(
+                "Gurobi returned an IIS, but none of its constraints mapped "
+                "to accepted block or linked-family surplus constraints."
+            )
+            return set()
+
+        return conflict_bid_ids
+
+    except Exception as exc:
+        logger.info(
+            "Native Gurobi IIS extraction is unavailable or failed (%s); "
+            "using deletion-based conflict reduction.",
+            exc,
+        )
+        return None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+
+
+def _deletion_based_price_conflict(
+    price_model: pyo.ConcreteModel,
+    solver: OptSolver,
+    solver_options: dict,
+) -> set[str]:
+    """
+    Reduce block-related constraints to a small infeasible conflict.
+
+    A candidate constraint is permanently removed from the temporary working
+    conflict whenever the remaining constraints are still infeasible.
+    """
+    conflict_mapping = _price_conflict_constraint_mapping(price_model)
+    candidates = list(conflict_mapping)
+
+    if not candidates:
+        return set()
+
+    retained = list(candidates)
+
+    try:
+        for constraint in list(candidates):
+            constraint.deactivate()
+
+            results = _solve_price_model(
+                solver=solver,
+                model=price_model,
+                solver_options=solver_options,
+            )
+
+            if _result_is_infeasible(results):
+                # This constraint is not needed for the current conflict.
+                retained.remove(constraint)
+            else:
+                # Removing it restores feasibility, so it is conflict-relevant.
+                constraint.activate()
+
+        if not retained:
+            return set()
+
+        conflict_bid_ids = set()
+
+        for constraint in retained:
+            conflict_bid_ids.update(conflict_mapping[constraint])
+
+        return conflict_bid_ids
+    finally:
+        for constraint in candidates:
+            constraint.activate()
+
+
+def _reference_block_surplus_per_mwh(
+    orders: Orderbook,
+    master_solution: dict,
+    diagnostic_prices: dict[tuple, float],
+    candidate_bid_ids: set[str],
+) -> dict[str, float]:
+    """
+    Calculate accepted-block reference surplus per MWh.
+
+    Signed block volumes are used in the surplus numerator and absolute
+    volumes in the accepted-energy denominator.
+    """
+    block_orders = {
+        order["bid_id"]: order
+        for order in orders
+        if order["bid_type"] in ["BB", "LB"]
+    }
+    surplus_per_mwh = {}
+
+    for bid_id in candidate_bid_ids:
+        order = block_orders.get(bid_id)
+
+        if order is None:
+            continue
+
+        acceptance = master_solution["block_acceptance"].get(bid_id, 0.0)
+
+        if acceptance <= EPS:
+            continue
+
+        surplus = sum(
+            (
+                diagnostic_prices[(timestamp, order["node"])]
+                - order["price"]
+            )
+            * volume
+            * MTU_DURATION_HOURS
+            * acceptance
+            for timestamp, volume in order["volume"].items()
+        )
+        accepted_energy = sum(
+            abs(volume) * MTU_DURATION_HOURS * acceptance
+            for volume in order["volume"].values()
+        )
+
+        if accepted_energy <= EPS:
+            surplus_per_mwh[bid_id] = 0.0
+        else:
+            surplus_per_mwh[bid_id] = surplus / accepted_energy
+
+    return surplus_per_mwh
+
+
+def _build_local_price_conflict(
+    price_model: pyo.ConcreteModel,
+    orders: Orderbook,
+    master_solution: dict,
+    solver: OptSolver,
+    solver_options: dict,
+    price_cut_delta_eur_per_mwh: float,
+) -> list[str]:
+    """
+    Find and delta-filter one local accepted-block pricing conflict.
+
+    This is a simplified EUPHEMIA-like heuristic based on local cuts and the
+    deeply-in-the-money delta protection described in Sections 7.4-7.5 and
+    Annex B of the public EUPHEMIA description.
+    """
+    diagnostic_prices = _diagnostic_prices_without_block_surplus(
+        price_model=price_model,
+        solver=solver,
+        solver_options=solver_options,
+    )
+
+    conflict_bid_ids = _try_gurobi_iis_conflict(price_model)
+
+    if conflict_bid_ids is None:
+        conflict_bid_ids = _deletion_based_price_conflict(
+            price_model=price_model,
+            solver=solver,
+            solver_options=solver_options,
+        )
+
+    accepted_active_ids = {
+        bid_id
+        for bid_id, selected in master_solution["selected_x"].items()
+        if selected == 1
+        and master_solution["block_acceptance"].get(bid_id, 0.0) > EPS
+    }
+    conflict_bid_ids = set(conflict_bid_ids).intersection(
+        accepted_active_ids
+    )
+
+    if not conflict_bid_ids:
+        raise RuntimeError(
+            "The price-feasibility LP is infeasible, but no accepted block "
+            "or linked-block family could be identified as responsible. "
+            "The simplified local-cut heuristic cannot classify the "
+            "infeasibility."
+        )
+
+    logger.info(
+        "Pricing conflict accepted block IDs before delta filtering: %s",
+        sorted(conflict_bid_ids, key=str),
+    )
+
+    surplus_per_mwh = _reference_block_surplus_per_mwh(
+        orders=orders,
+        master_solution=master_solution,
+        diagnostic_prices=diagnostic_prices,
+        candidate_bid_ids=conflict_bid_ids,
+    )
+
+    deeply_in_the_money = {
+        bid_id
+        for bid_id in conflict_bid_ids
+        if surplus_per_mwh.get(bid_id, float("-inf"))
+        > price_cut_delta_eur_per_mwh
+    }
+
+    if deeply_in_the_money:
+        logger.info(
+            "Excluding deeply in-the-money blocks from the local price cut "
+            "(delta %.3f EUR/MWh): %s; diagnostic surplus/MWh: %s",
+            price_cut_delta_eur_per_mwh,
+            sorted(deeply_in_the_money, key=str),
+            {
+                bid_id: surplus_per_mwh[bid_id]
+                for bid_id in sorted(deeply_in_the_money, key=str)
+            },
+        )
+
+    filtered_conflict = conflict_bid_ids.difference(deeply_in_the_money)
+
+    if not filtered_conflict:
+        logger.warning(
+            "Delta filtering removed every block from the local pricing "
+            "conflict. Deeply in-the-money protection is being relaxed and "
+            "the unfiltered IIS/conflict set will be used: %s",
+            sorted(conflict_bid_ids, key=str),
+        )
+        filtered_conflict = conflict_bid_ids
+
+    return sorted(filtered_conflict, key=str)
 
 def solve_master_with_price_cuts(
     master_model: pyo.ConcreteModel,
@@ -1433,15 +1826,26 @@ def solve_master_with_price_cuts(
     price_cap: float,
     solver: OptSolver,
     solver_options: dict,
+    price_cut_delta_eur_per_mwh: float = 25.0, #TODO decide on good default
     timing_enabled: bool = False,
 ):
-    """Find a welfare-optimal and price-feasible block selection."""
+    """
+    Find a welfare-optimal and price-feasible block selection.
+
+    Price infeasibilities are handled with simplified EUPHEMIA-like local
+    cuts. Only accepted blocks identified by an IIS or reduced conflict are
+    included; rejected and unrelated bids are never included.
+    """
     cuts_added = 0
     iteration = 0
 
+    if price_cut_delta_eur_per_mwh < 0.0:
+        raise ValueError(
+            "price_cut_delta_eur_per_mwh must be non-negative."
+        )
+
     while True:
         iteration += 1
-
         master_solve_start = perf_counter()
 
         try:
@@ -1458,7 +1862,8 @@ def solve_master_with_price_cuts(
         if _result_is_infeasible(results):
             if cuts_added:
                 raise Exception(
-                    "No price-feasible discrete market-clearing solution exists."
+                    "No price-feasible discrete market-clearing solution "
+                    "exists after applying local pricing-conflict cuts."
                 )
             raise Exception("Market-clearing problem is infeasible.")
 
@@ -1495,7 +1900,7 @@ def solve_master_with_price_cuts(
         finally:
             _log_stage_duration(
                 stage_name=(
-                    f"Price-feasibility solve within "
+                    "Price-feasibility solve within "
                     f"solve_master_with_price_cuts (iteration {iteration})"
                 ),
                 start_time=price_feasibility_start,
@@ -1511,25 +1916,57 @@ def solve_master_with_price_cuts(
                 f"({price_results.solver.termination_condition})."
             )
 
+        logger.warning(
+            "Pricing infeasibility detected in master iteration %s. "
+            "Building a local accepted-block conflict cut.",
+            iteration,
+        )
+
         if not list(master_model.bBids):
             raise Exception(
-                "No price-feasible market-clearing solution exists."
+                "The price-feasibility LP is infeasible, but the master "
+                "contains no block bids. The simplified local-cut heuristic "
+                "cannot classify the infeasibility."
             )
 
-        accepted_ids = [
+        conflict_bid_ids = _build_local_price_conflict(
+            price_model=price_model,
+            orders=orders,
+            master_solution=master_solution,
+            solver=solver,
+            solver_options=solver_options,
+            price_cut_delta_eur_per_mwh=(
+                price_cut_delta_eur_per_mwh
+            ),
+        )
+
+        # Defensive validation: cuts may reference only known, currently
+        # accepted block binaries.
+        conflict_bid_ids = [
             bid_id
-            for bid_id in master_model.bBids
-            if master_solution["selected_x"][bid_id] == 1
-        ]
-        rejected_ids = [
-            bid_id
-            for bid_id in master_model.bBids
-            if master_solution["selected_x"][bid_id] == 0
+            for bid_id in conflict_bid_ids
+            if bid_id in master_model.bBids
+            and master_solution["selected_x"].get(bid_id) == 1
+            and master_solution["block_acceptance"].get(bid_id, 0.0) > EPS
         ]
 
+        if not conflict_bid_ids:
+            raise RuntimeError(
+                "Local price-conflict classification produced no known, "
+                "active, accepted block bids. No global pattern cut will be "
+                "added."
+            )
+
+        logger.info(
+            "Adding local price-feasibility cut over accepted blocks: %s",
+            conflict_bid_ids,
+        )
+
         master_model.price_feasibility_cuts.add(
-            sum(1 - master_model.x[bid_id] for bid_id in accepted_ids)
-            + sum(master_model.x[bid_id] for bid_id in rejected_ids)
+            sum(
+                1 - master_model.x[bid_id]
+                for bid_id in conflict_bid_ids
+            )
             >= 1
         )
         cuts_added += 1
@@ -2049,6 +2486,20 @@ class ComplexClearingRole(MarketRole):
             "pricing_mechanism",
             "pay_as_clear",
         )
+        # Simplified EUPHEMIA-like delta protection for deeply
+        # in-the-money blocks in local price-feasibility cuts.
+        # Default: 25.0 EUR/MWh.
+        self.price_cut_delta_eur_per_mwh = float(
+            self.marketconfig.param_dict.get(
+                "price_cut_delta_eur_per_mwh",
+                25.0,
+            )
+        )
+
+        if self.price_cut_delta_eur_per_mwh < 0.0:
+            raise ValueError(
+                "price_cut_delta_eur_per_mwh must be non-negative."
+            )        
         self.zone_column = self.marketconfig.param_dict.get(
             "zones_identifier",
             "zone_id",
@@ -2159,6 +2610,8 @@ class ComplexClearingRole(MarketRole):
             "exclusive_group_id" in self.marketconfig.additional_fields
         )
 
+        regular_orders = []
+
         for order in orderbook:
             if order.get("bid_type") is None:
                 order["bid_type"] = "SB"
@@ -2173,9 +2626,18 @@ class ComplexClearingRole(MarketRole):
                 order["bid_type"] = "SB"
 
             if order["bid_type"] == "SO":
+                # Do not pass Storage Orders to the base validator.
+                #
+                # The base validator calls separate_orders(), which assumes
+                # dictionary-valued fields are ordinary profile-order fields.
+                # A Storage Order instead has an empty `volume` mapping and
+                # separate timestamp mappings for its operating limits.
                 _validate_storage_order_static(order)
+            else:
+                regular_orders.append(order)
 
-        super().validate_orderbook(orderbook, agent_addr)
+        if regular_orders:
+            super().validate_orderbook(regular_orders, agent_addr)
 
         for order in orderbook:
             if order["bid_type"] in ["BB", "LB"]:
@@ -2208,16 +2670,16 @@ class ComplexClearingRole(MarketRole):
             if order["bid_type"] == "SO":
                 if order.get("exclusive_group_id") is not None:
                     raise ValueError(
-                        f"Storage Order '{order['bid_id']}' cannot belong to an "
-                        "exclusive group."
+                        f"Storage Order '{order['bid_id']}' cannot belong to "
+                        "an exclusive group."
                     )
 
                 if order.get("parent_bid_id") is not None:
                     raise ValueError(
-                        f"Storage Order '{order['bid_id']}' cannot be linked to "
-                        "another bid."
+                        f"Storage Order '{order['bid_id']}' cannot be linked "
+                        "to another bid."
                     )
-                
+
             node = order.get("node")
 
             if node is None:
@@ -2371,6 +2833,7 @@ class ComplexClearingRole(MarketRole):
             price_cap=price_cap,
             solver=self.solver,
             solver_options=self.solver_options,
+            price_cut_delta_eur_per_mwh=self.price_cut_delta_eur_per_mwh,
             timing_enabled=self.log_performance,
         )
 

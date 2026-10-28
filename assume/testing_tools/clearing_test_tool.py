@@ -621,24 +621,40 @@ class ClearingTestTool:
         blocks: list[dict],
         default_node: str,
     ) -> Orderbook:
-        """Convert parsed 96-interval block rows to ASSUME block orders."""
+        """
+        Convert parsed block rows to ASSUME block orders.
+
+        The volume mapping must be contiguous between start_time and end_time,
+        including zero-volume MTUs. This is required by separate_orders(), which
+        otherwise derives invalid timestamps for sparse block profiles.
+        """
         orderbook: Orderbook = []
 
         for block in blocks:
-            volume = {
-                self._interval_start(interval): quantity
-                for interval, quantity in enumerate(block["intervals"])
+            all_volumes = block["intervals"]
+            active_intervals = [
+                interval
+                for interval, quantity in enumerate(all_volumes)
                 if abs(quantity) > 0.0
-            }
+            ]
 
-            if not volume:
+            if not active_intervals:
                 logger.warning(
                     "Skipping block '%s' because it has no non-zero volume.",
                     block["raw_id"],
                 )
                 continue
 
-            timestamps = sorted(volume)
+            first_interval = min(active_intervals)
+            last_interval = max(active_intervals)
+
+            # Preserve every MTU between the first and final active MTU,
+            # including any zero-volume gaps within a block profile.
+            volume = {
+                self._interval_start(interval): all_volumes[interval]
+                for interval in range(first_interval, last_interval + 1)
+            }
+
             is_linked = (
                 block["type"] == "C02"
                 and block["special_id"] is not None
@@ -647,6 +663,9 @@ class ClearingTestTool:
                 block["type"] == "C04"
                 and block["special_id"] is not None
             )
+
+            start_time = self._interval_start(first_interval)
+            end_time = self._interval_start(last_interval) + MTU_DURATION
 
             orderbook.append(
                 {
@@ -659,19 +678,15 @@ class ClearingTestTool:
                     "price": block["price"],
                     "volume": volume,
                     "node": block["bidding_zone"] or default_node,
-                    "start_time": timestamps[0],
-                    "end_time": timestamps[-1] + MTU_DURATION,
+                    "start_time": start_time,
+                    "end_time": end_time,
                     "only_hours": None,
                     "min_acceptance_ratio": block["acc_ratio"],
                     "parent_bid_id": (
-                        block["special_id"]
-                        if is_linked
-                        else None
+                        block["special_id"] if is_linked else None
                     ),
                     "exclusive_group_id": (
-                        block["special_id"]
-                        if is_exclusive
-                        else None
+                        block["special_id"] if is_exclusive else None
                     ),
                 }
             )
@@ -922,12 +937,33 @@ class ClearingTestTool:
             self.market_products
         )
 
+        # MarketRole.validate_orderbook requires every field listed in
+        # MarketConfig.additional_fields to exist on every order, even when a field
+        # is not applicable to that particular bid type.
+        optional_fields = (
+            "bid_type",
+            "min_acceptance_ratio",
+            "parent_bid_id",
+            "exclusive_group_id",
+            "node",
+            "starting_energy",
+            "efficiency",
+            "cycling_cost",
+            "end_of_day_value",
+            "max_energy",
+            "min_energy",
+            "max_input_power",
+            "max_output_power",
+        )
+
         for order in working_orderbook:
+            for field in optional_fields:
+                order.setdefault(field, None)
+
             self.clearing_algorithm.validate_orderbook(
                 [order],
                 order["agent_addr"],
             )
-
         logger.info(
             "Running '%s' for market '%s' over %s 15-minute MTUs.",
             self.clearing_type,

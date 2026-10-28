@@ -1,2 +1,0 @@
-name,bus0,bus1,s_nom,s_max_pu,capacity_method,losses,tariff,ramping_limit
-line_DE_FR,DE,FR,1000.0,1.0,ATC,0.0,0.0,0.0

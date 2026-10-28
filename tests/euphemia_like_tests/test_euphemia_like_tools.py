@@ -6,7 +6,6 @@
 """
 Shared tooling for the EUPHEMIA-like validation suite.
 
-This module replaces both a ``conftest.py`` and a separate utility module.
 It provides:
 
 - fixed 15-minute market-product factories;
