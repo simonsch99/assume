@@ -39,9 +39,11 @@ from assume.common.market_objects import (
     MarketProduct,
     Orderbook,
 )
-from assume.markets.clearing_algorithms.euphemia_like import (
+from clearing_algorithm.euphemia_like import (
     ComplexClearingRole as EuphemiaLikeClearingRole,
 )
+
+from tools.order_layout import native_profile_columns, read_block_layout
 
 logger = logging.getLogger(__name__)
 
@@ -142,55 +144,70 @@ class QuarterHourlyOrderReader:
         logger.info("Read %s simple orders from %s.", len(orders), path)
         return orders
 
-
 class BlockOrderReader:
-    """
-    Read block orders from layout_block_orders.csv.
-
-    The trailing field at index 104 is ``bidding_zone``. An empty zone is
-    resolved by ClearingTestTool.default_node.
-    """
+    """Read native-layout EPEX-like block bids."""
 
     def read(self, path: str | Path) -> list[dict]:
-        blocks = []
+        layout = read_block_layout(path)
+        blocks = layout.frame.copy()
+        profile_columns = native_profile_columns(blocks.columns)
 
-        with Path(path).open(newline="") as file:
-            reader = csv.reader(file, delimiter=";")
-
-            for line_number, row in enumerate(reader, start=1):
-                if not row or row[0].strip() != "BB":
-                    continue
-
-                try:
-                    blocks.append(self._read_line(row))
-                except (ValueError, IndexError) as error:
-                    logger.warning(
-                        "Skipping block row %s: %s",
-                        line_number,
-                        error,
-                    )
-
-        logger.info("Read %s block orders from %s.", len(blocks), path)
-        return blocks
-
-    @staticmethod
-    def _read_line(row: list[str]) -> dict:
-        if len(row) < 105:
+        required = {
+            "Data type(BB)",
+            "BlockID",
+            "Block Type",
+            "BlockCodePRM",
+            "Limit Price",
+            "MAR",
+            "bidding_zone",
+        }
+        missing = required.difference(blocks.columns)
+        if missing:
             raise ValueError(
-                "Block rows must contain 105 columns, including "
-                "trailing bidding_zone."
+                f"Block-order CSV is missing columns: {sorted(missing)}"
             )
 
-        return {
-            "raw_id": row[1].strip(),
-            "type": row[2].strip(),
-            "special_id": row[3].strip() or None,
-            "price": float(row[5]),
-            "intervals": [-float(row[6 + interval]) for interval in range(96)],
-            "acc_ratio": float(row[102]) if row[102].strip() else None,
-            "bidding_zone": row[104].strip(),
-        }
+        result = []
 
+        for row_number, (_, row) in enumerate(blocks.iterrows(), start=1):
+            if str(row["Data type(BB)"]).strip() != "BB":
+                continue
+
+            try:
+                result.append(
+                    {
+                        "raw_id": str(row["BlockID"]).strip(),
+                        "type": str(row["Block Type"]).strip(),
+                        "special_id": (
+                            str(row["BlockCodePRM"]).strip() or None
+                        ),
+                        "price": float(row["Limit Price"]),
+                        # Native convention:
+                        # positive raw profile = sell;
+                        # negative raw profile = purchase.
+                        # ASSUME convention is the reverse sign.
+                        "intervals": [
+                            -float(row[column])
+                            for column in profile_columns
+                        ],
+                        "acc_ratio": (
+                            float(row["MAR"])
+                            if str(row["MAR"]).strip()
+                            else None
+                        ),
+                        "bidding_zone": (
+                            str(row["bidding_zone"]).strip()
+                        ),
+                    }
+                )
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "Skipping block row %s: %s",
+                    row_number,
+                    exc,
+                )
+
+        return result
 
 class StorageOrderReader:
     """
@@ -540,6 +557,33 @@ class ClearingTestTool:
         self.market_products = self._build_market_products()
         self._validate_network_market_product_snapshots()
 
+        # Check that orders exist for each zone
+        if self.network is not None:
+            order_zones = {str(order["node"]) for order in orderbook}
+            network_zones = {
+                str(zone)
+                for zone in self.network.buses[
+                    self.zones_identifier
+                ].dropna().unique()
+            }
+
+            unknown_zones = order_zones.difference(network_zones)
+
+            if unknown_zones:
+                raise ValueError(
+                    "Order zones do not exist in the network: "
+                    f"{sorted(unknown_zones)}"
+                )
+
+            if self.flowbased_region:
+                missing_order_zones = set(self.flowbased_region).difference(order_zones)
+
+                if missing_order_zones:
+                    raise ValueError(
+                        "The FBMC region contains zones without submitted orders: "
+                        f"{sorted(missing_order_zones)}"
+                    )
+                
         logger.info(
             "Built orderbook with %s orders: %s simple, %s block, %s storage.",
             len(orderbook),

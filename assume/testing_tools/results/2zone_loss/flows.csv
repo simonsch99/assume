@@ -1,3 +1,0 @@
-time,line,flow,flow_pos,flow_neg,tariff_rate,tariff_cost,loss_rate,losses
-2026-08-12 00:00:00,line_DE_FR,-1000.0,0.0,1000.0,5.0,5000.0,0.0,0.0
-2026-08-12 01:00:00,line_DE_FR,1000.0,1000.0,0.0,5.0,5000.0,0.0,0.0

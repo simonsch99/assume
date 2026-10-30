@@ -9,7 +9,7 @@ import logging
 import pandas as pd
 import pypsa
 
-from clearing_test_tool import ClearingTestTool
+from Thesis_BESS.tools.clearing_test_tool import ClearingTestTool
 
 MTU_DURATION = timedelta(minutes=15)
 MTU_DURATION_HOURS = 0.25

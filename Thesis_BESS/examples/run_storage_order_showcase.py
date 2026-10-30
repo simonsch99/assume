@@ -40,7 +40,7 @@ from pathlib import Path
 import pandas as pd
 import pypsa
 
-from clearing_test_tool import ClearingTestTool
+from Thesis_BESS.tools.clearing_test_tool import ClearingTestTool
 
 logging.basicConfig(
     level=logging.INFO,

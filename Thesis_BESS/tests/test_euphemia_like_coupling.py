@@ -49,7 +49,7 @@ from .test_euphemia_like_tools import (
     require_linopy_solver,
 )
 
-from assume.common.fbmc_utils import (
+from Thesis_BESS.clearing_algorithm.fbmc_utils import (
     calculate_lodf,
     calculate_nodal_ptdf,
     precompute_fbmc_parameters,

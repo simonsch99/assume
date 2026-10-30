@@ -33,7 +33,7 @@ from dateutil import rrule as rr
 from pyomo.opt import SolverFactory
 
 from assume.common.market_objects import MarketConfig, MarketProduct
-from assume.markets.clearing_algorithms.euphemia_like import ComplexClearingRole
+from Thesis_BESS.clearing_algorithm.euphemia_like import ComplexClearingRole
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -510,7 +510,7 @@ def precompute_fbmc_clearing_input(
     """
     require_linopy_solver()
 
-    from assume.common.fbmc_utils import (
+    from Thesis_BESS.clearing_algorithm.fbmc_utils import (
         precompute_fbmc_parameters,
         to_clearing_input,
     )

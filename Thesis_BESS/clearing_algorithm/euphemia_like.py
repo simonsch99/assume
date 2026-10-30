@@ -45,7 +45,7 @@ import pypsa
 from mango import AgentAddress
 from pyomo.opt import OptSolver, SolverFactory, ProblemFormat
 
-from assume.common.fbmc_utils import (
+from clearing_algorithm.fbmc_utils import (
     precompute_fbmc_parameters,
     to_clearing_input,
 )
@@ -2514,8 +2514,8 @@ class ComplexClearingRole(MarketRole):
             "ntc_connections"
         )
 
-        self.market_zone_ids: list[str] = []
-        self.node_to_zone: dict = {}
+        self.market_zone_ids = []
+        self.node_to_zone = {}
 
         if self.network is not None:
             if self.zone_column not in self.network.buses.columns:
@@ -2524,10 +2524,19 @@ class ComplexClearingRole(MarketRole):
                     f"'{self.zone_column}'."
                 )
 
-            self.market_zone_ids = list(
-                pd.Index(self.network.buses[self.zone_column].unique())
-            )
-            self.node_to_zone = self.network.buses[self.zone_column].to_dict()
+            self.market_zone_ids = [
+                str(zone)
+                for zone in self.network.buses[self.zone_column]
+                .dropna()
+                .unique()
+            ]
+
+            self.node_to_zone = {
+                str(bus_id): str(zone)
+                for bus_id, zone in self.network.buses[
+                    self.zone_column
+                ].dropna().items()
+            }
 
         if self.flowbased_region and self.network is None:
             raise ValueError(
@@ -2696,8 +2705,22 @@ class ComplexClearingRole(MarketRole):
                 )
                 continue
 
+            node = str(node).strip()
+            order["node"] = node
+
+            if node in self.market_zone_ids:
+                # Zone labels have priority over bus IDs.
+                continue
+
             if node in self.node_to_zone:
                 order["node"] = self.node_to_zone[node]
+                continue
+
+            if self.network is not None:
+                raise ValueError(
+                    f"Order '{order['bid_id']}' refers to unknown zone or bus "
+                    f"'{node}'. Known zones: {sorted(self.market_zone_ids)}"
+                )
 
     def clear(
         self,

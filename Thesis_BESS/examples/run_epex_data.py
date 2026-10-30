@@ -5,7 +5,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from clearing_test_tool import ClearingTestTool
+from Thesis_BESS.tools.clearing_test_tool import ClearingTestTool
 
 ZERO_TOLERANCE = 1e-9
 
