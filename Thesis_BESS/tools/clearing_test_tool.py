@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Literal
 from math import isfinite
 from typing import Iterator
+from urllib.parse import quote
 
 import pandas as pd
 import pypsa
@@ -1106,43 +1107,383 @@ class ClearingTestTool:
 
         return pd.DataFrame(rows)
 
+    @staticmethod
+    def _format_csv_price(value):
+        """
+        Format scalar prices to two decimals.
+
+        Dictionary-valued prices retain numeric JSON values, rounded to
+        two decimals. Non-price fields are not modified.
+        """
+        def round_nested(item):
+            if isinstance(item, dict):
+                return {
+                    key: round_nested(number)
+                    for key, number in item.items()
+                }
+
+            if item is None:
+                return None
+
+            number = round(float(item), 2)
+            return 0.0 if number == 0.0 else number
+
+        if value is None:
+            return None
+
+        if isinstance(value, dict):
+            return json.dumps(
+                round_nested(
+                    {str(key): item for key, item in value.items()}
+                )
+            )
+
+        # _orders_to_dataframe() already serializes price mappings.
+        if isinstance(value, str) and value.lstrip().startswith("{"):
+            return json.dumps(round_nested(json.loads(value)))
+
+        number = float(value)
+
+        if not isfinite(number):
+            return value
+
+        rounded = round(number, 2)
+
+        # Avoid exporting "-0.00".
+        return f"{0.0 if rounded == 0.0 else rounded:.2f}"
+
+    def _write_result_csv(
+        self,
+        frame: pd.DataFrame,
+        path: Path,
+    ) -> None:
+        """Write a CSV without changing the in-memory result precision."""
+        frame = frame.copy()
+
+        # Storage cycling cost and terminal value are also EUR/MWh values.
+        price_columns = {
+            "price",
+            "max_price",
+            "min_price",
+            "accepted_price",
+            "Price",
+            "cycling_cost",
+            "end_of_day_value",
+        }
+
+        for column in price_columns.intersection(frame.columns):
+            frame[column] = frame[column].map(self._format_csv_price)
+
+        frame.to_csv(path, index=False)
+
+    def _aggregated_curves_to_dataframe(
+        self,
+        zone,
+        meta: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Build cumulative EPEX-style step curves for one zone.
+
+        Volumes remain positive MW on both sides. Sell curves increase
+        with price; Purchase curves decrease with price.
+
+        Every original or synthetic bid contributes its own volume step,
+        including when multiple bids have the same price.
+        """
+        columns = [
+            "Date",
+            "Week",
+            "Week Day",
+            "Hour",
+            "Quarter hour",
+            "Price",
+            "Volume",
+            "Sale/Purchase",
+        ]
+
+        config = self.clearing_algorithm.marketconfig
+        price_floor = float(config.param_dict.get("price_floor", -500.0))
+        price_cap = float(config.param_dict.get("price_cap", 4000.0))
+
+        timestamps = sorted(
+            pd.Timestamp(product[0])
+            for product in self.market_products
+        )
+        bids = {
+            timestamp: {"Sell": [], "Purchase": []}
+            for timestamp in timestamps
+        }
+
+        def add_bid(timestamp, side, price, volume):
+            timestamp = pd.Timestamp(timestamp)
+            volume = float(volume)
+
+            if timestamp not in bids:
+                raise ValueError(
+                    f"Curve bid timestamp '{timestamp}' is outside "
+                    "the clearing horizon."
+                )
+
+            if volume > 0.0:
+                bids[timestamp][side].append((float(price), volume))
+
+        # Use the cleared order objects so zone normalization and any
+        # validation/clipping are reflected in the exported curves.
+        orders = [
+            *self.results["accepted_orders"],
+            *self.results["rejected_orders"],
+        ]
+
+        for order in orders:
+            if order.get("node") != zone:
+                continue
+
+            if order["bid_type"] == "SB":
+                volume = float(order["volume"])
+
+                if volume != 0.0:
+                    add_bid(
+                        order["start_time"],
+                        "Sell" if volume > 0.0 else "Purchase",
+                        order["price"],
+                        abs(volume),
+                    )
+
+        # Aggregate executed blocks separately from storage and exchanges.
+        block_sell = {timestamp: 0.0 for timestamp in timestamps}
+        block_purchase = {timestamp: 0.0 for timestamp in timestamps}
+        storage_sell = {timestamp: 0.0 for timestamp in timestamps}
+        storage_purchase = {timestamp: 0.0 for timestamp in timestamps}
+
+        for order in self.results["accepted_orders"]:
+            if order.get("node") != zone:
+                continue
+
+            if order["bid_type"] in {"BB", "LB"}:
+                for timestamp, volume in order["accepted_volume"].items():
+                    timestamp = pd.Timestamp(timestamp)
+                    volume = float(volume)
+
+                    if volume > 0.0:
+                        block_sell[timestamp] += volume
+                    elif volume < 0.0:
+                        block_purchase[timestamp] -= volume
+
+            elif order["bid_type"] == "SO":
+                for timestamp, volume in order.get("discharge", {}).items():
+                    storage_sell[pd.Timestamp(timestamp)] += max(
+                        0.0, float(volume)
+                    )
+
+                for timestamp, volume in order.get("charge", {}).items():
+                    storage_purchase[pd.Timestamp(timestamp)] += max(
+                        0.0, float(volume)
+                    )
+
+        zone_meta = meta.loc[meta["zone"] == zone].set_index(
+            "product_start"
+        )
+        zone_meta.index = pd.DatetimeIndex(zone_meta.index)
+
+        for timestamp in timestamps:
+            outcome = zone_meta.loc[timestamp]
+
+            # Positive net position means net export.
+            net_position = (
+                float(outcome["supply_volume"])
+                - float(outcome["demand_volume"])
+            )
+
+            add_bid(
+                timestamp,
+                "Sell",
+                price_floor,
+                max(0.0, -net_position),
+            )
+            add_bid(
+                timestamp,
+                "Purchase",
+                price_cap,
+                max(0.0, net_position),
+            )
+
+            # These remain separate synthetic bids at the same endpoint.
+            add_bid(
+                timestamp, "Sell", price_floor, block_sell[timestamp]
+            )
+            add_bid(
+                timestamp,
+                "Purchase",
+                price_cap,
+                block_purchase[timestamp],
+            )
+            add_bid(
+                timestamp, "Sell", price_floor, storage_sell[timestamp]
+            )
+            add_bid(
+                timestamp,
+                "Purchase",
+                price_cap,
+                storage_purchase[timestamp],
+            )
+
+        rows = []
+
+        def append_point(timestamp, side, price, volume):
+            rows.append(
+                {
+                    "Date": timestamp.strftime("%d/%m/%Y"),
+                    "Week": int(timestamp.isocalendar().week),
+                    "Week Day": timestamp.isoweekday(),
+                    "Hour": timestamp.hour + 1,
+                    "Quarter hour": timestamp.minute // 15 + 1,
+                    "Price": price,
+                    "Volume": max(0.0, volume),
+                    "Sale/Purchase": side,
+                }
+            )
+
+        for timestamp in timestamps:
+            for side in ("Sell", "Purchase"):
+                # Sort using full-precision bid prices. Rounding happens
+                # only when writing the CSV.
+                side_bids = sorted(
+                    bids[timestamp][side],
+                    key=lambda bid: bid[0],
+                )
+
+                cumulative = (
+                    0.0
+                    if side == "Sell"
+                    else sum(volume for _, volume in side_bids)
+                )
+
+                append_point(
+                    timestamp, side, price_floor, cumulative
+                )
+
+                for price, volume in side_bids:
+                    # Before/after points at the same price represent
+                    # a discrete bid's vertical volume step.
+                    append_point(timestamp, side, price, cumulative)
+
+                    cumulative += (
+                        volume if side == "Sell" else -volume
+                    )
+
+                    append_point(timestamp, side, price, cumulative)
+
+                append_point(
+                    timestamp, side, price_cap, cumulative
+                )
+
+        return pd.DataFrame(rows, columns=columns)
+
     def export_results(
         self,
         output_dir: str | Path,
         include_flows: bool = True,
     ) -> None:
-        """Export accepted orders, rejected orders, prices, and flows."""
+        """
+        Export orders, market metadata, flows, CNECs, and zonal curves.
+
+        include_flows controls only flows.csv and CNECs.csv.
+        Aggregated curves are always exported.
+        """
+        if self.clearing_algorithm is None:
+            raise RuntimeError(
+                "No clearing results exist. Call run_clearing() first."
+            )
+
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        self._orders_to_dataframe(
-            self.results["accepted_orders"]
-        ).to_csv(
-            output_dir / "accepted_orders.csv",
-            index=False,
+        for result_key, filename in (
+            ("accepted_orders", "accepted_orders.csv"),
+            ("rejected_orders", "rejected_orders.csv"),
+        ):
+            self._write_result_csv(
+                self._orders_to_dataframe(self.results[result_key]),
+                output_dir / filename,
+            )
+
+        meta = pd.DataFrame(self.results["market_meta"]).drop(
+            columns=["only_hours"],
+            errors="ignore",
         )
 
-        self._orders_to_dataframe(
-            self.results["rejected_orders"]
-        ).to_csv(
-            output_dir / "rejected_orders.csv",
-            index=False,
-        )
+        if not meta.empty:
+            # Also support results produced before matched_volume was
+            # added to extract_results().
+            meta["matched_volume"] = meta[
+                ["supply_volume", "demand_volume"]
+            ].max(axis=1)
 
-        pd.DataFrame(
-            self.results["market_meta"]
-        ).to_csv(
+        self._write_result_csv(
+            meta,
             output_dir / "market_meta.csv",
-            index=False,
         )
 
         if include_flows:
-            line_results = self.results.get("line_results", [])
+            flow_columns = [
+                "time",
+                "line",
+                "flow",
+                "network_type",
+            ]
+            cnec_columns = [
+                *flow_columns,
+                "cnec",
+                "cne",
+                "contingency",
+                "direction",
+                "ram",
+                "fb_flow",
+                "slack",
+                "binding",
+                "utilization",
+            ]
 
-            if line_results:
-                pd.DataFrame(line_results).to_csv(
-                    output_dir / "flows.csv",
-                    index=False,
+            line_frame = pd.DataFrame(
+                self.results.get("line_results", [])
+            )
+
+            if line_frame.empty:
+                flow_frame = pd.DataFrame(columns=flow_columns)
+                cnec_frame = pd.DataFrame(columns=cnec_columns)
+            else:
+                is_cnec = line_frame["network_type"].eq("FBMC_CNEC")
+
+                # Preserve the current first section and its four fields.
+                flow_frame = line_frame.loc[
+                    ~is_cnec
+                ].reindex(columns=flow_columns)
+
+                # Preserve CNEC diagnostic fields and values unchanged.
+                cnec_frame = line_frame.loc[is_cnec].copy()
+
+                if cnec_frame.empty:
+                    cnec_frame = pd.DataFrame(columns=cnec_columns)
+
+            self._write_result_csv(
+                flow_frame,
+                output_dir / "flows.csv",
+            )
+            self._write_result_csv(
+                cnec_frame,
+                output_dir / "CNECs.csv",
+            )
+
+        if not meta.empty:
+            for zone in meta["zone"].drop_duplicates():
+                # Ordinary labels remain unchanged; path separators and
+                # other unsafe filename characters are escaped.
+                zone_filename = quote(str(zone), safe="-_.")
+
+                self._write_result_csv(
+                    self._aggregated_curves_to_dataframe(zone, meta),
+                    output_dir
+                    / f"aggregated_curves_{zone_filename}.csv",
                 )
 
         logger.info("Results exported to %s.", output_dir)

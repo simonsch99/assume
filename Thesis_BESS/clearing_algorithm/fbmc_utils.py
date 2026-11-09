@@ -1296,7 +1296,7 @@ def calculate_direct_ram(
 
 def precompute_fbmc_parameters(
     network: pypsa.Network,
-    alpha: float = 0.25, # default 0.05
+    alpha: float = 0.20, # default 0.05
     frm: float = 0.10,  # default 0.10
     min_ram: float = 0.0, # default 0.10
     lodf_sensitivity: float = 0.50, # default 0.10

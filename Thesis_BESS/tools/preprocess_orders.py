@@ -106,7 +106,7 @@ def price_segment(price: float, side: str) -> str:
 
 def add_clearing_price_bins(orders: pd.DataFrame, prices_csv: str | Path) -> pd.DataFrame:
     """Add ``_bin`` using published quarter-hourly clearing prices."""
-    prices = pd.read_csv(prices_csv, comment="#")
+    prices = pd.read_csv(prices_csv, comment="#").copy()
     prices.columns = [str(column).strip() for column in prices.columns]
 
     if "Delivery day" not in prices.columns:
@@ -232,6 +232,82 @@ def process_simple_orders(
     write_simple_layout(layout, output_csv)
     LOG.info("Wrote %d preprocessed simple orders to %s", len(result), output_csv)
 
+def remove_loop_blocks(blocks: pd.DataFrame) -> pd.DataFrame:
+    """Remove reciprocal two-block C02 loops without modifying other bids."""
+
+    def normalise_ids(values: pd.Series) -> pd.Series:
+        # Normalize only for comparison; preserve original output fields.
+        return (
+            values.astype("string")
+            .fillna("")
+            .str.strip()
+            .str.replace(r"^(\d+)\.0+$", r"\1", regex=True)
+        )
+
+    ids = normalise_ids(blocks["BlockID"])
+    references = normalise_ids(blocks["BlockCodePRM"])
+    linked = blocks["Block Type"].astype("string").str.strip().eq("C02")
+
+    if ids.eq("").any():
+        raise ValueError("Block orders contain an empty BlockID")
+
+    if ids.duplicated().any():
+        duplicates = ids.loc[ids.duplicated(keep=False)].unique().tolist()
+        raise ValueError(
+            "Loop filtering requires unique BlockIDs within the input "
+            f"delivery day. Duplicate IDs: {duplicates}"
+        )
+
+    links = dict(zip(ids.loc[linked], references.loc[linked]))
+    pairs = set()
+
+    for block_id, reference in links.items():
+        if reference != block_id and links.get(reference) == block_id:
+            pairs.add(tuple(sorted((block_id, reference))))
+
+    if not pairs:
+        return blocks
+
+    removed_ids = {
+        block_id
+        for pair in pairs
+        for block_id in pair
+    }
+
+    # Do not leave retained linked blocks pointing to deleted blocks.
+    external_links = (
+        linked
+        & ~ids.isin(removed_ids)
+        & references.isin(removed_ids)
+    )
+    if external_links.any():
+        relationships = [
+            f"{block_id} -> {reference}"
+            for block_id, reference in zip(
+                ids.loc[external_links],
+                references.loc[external_links],
+            )
+        ]
+        raise ValueError(
+            "Cannot remove loop blocks: other linked blocks reference them: "
+            + ", ".join(relationships)
+        )
+
+    result = blocks.loc[~ids.isin(removed_ids)].copy()
+
+    for first, second in sorted(pairs):
+        LOG.warning(
+            "Removed EPEX loop block %s (reciprocal partner %s).",
+            first,
+            second,
+        )
+        LOG.warning(
+            "Removed EPEX loop block %s (reciprocal partner %s).",
+            second,
+            first,
+        )
+
+    return result
 
 def process_block_bids(
     input_csv: str | Path,
@@ -252,6 +328,8 @@ def process_block_bids(
         raise ValueError(f"Block-order file is missing columns: {sorted(missing)}")
 
     blocks = blocks.loc[blocks["Data type(BB)"].eq("BB")].copy()
+    blocks = remove_loop_blocks(blocks)
+
     blocks["Limit Price"] = pd.to_numeric(blocks["Limit Price"], errors="raise")
     blocks[profiles] = blocks[profiles].apply(pd.to_numeric, errors="raise")
 

@@ -1,11 +1,12 @@
 """
-Create plots from clearing result files.
+Create plots from clearing result files for storage and non-storage scenarios.
 
-Required inputs:
+Required inputs per scenario:
     - market_meta.csv
     - flows.csv
+    - CNECs.csv
 
-Created figures:
+Created figures per scenario:
     1. zonal_prices.png
     2. zonal_supply_demand.png
     3. zonal_net_exports.png
@@ -14,7 +15,6 @@ Created figures:
 
 from __future__ import annotations
 
-from math import ceil
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -27,24 +27,25 @@ import seaborn as sns
 # CONFIGURATION
 # =============================================================================
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+TOOLS_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = TOOLS_DIR.parent
 
-RESULTS_DIR = BASE_DIR / "output" / "three_zone_run"
-MARKET_META_FILE = RESULTS_DIR / "results" / "market_meta.csv"
-FLOWS_FILE = RESULTS_DIR / "results" / "flows.csv"
+RESULTS_DIR = PROJECT_DIR / "output" / "three_zone_run" / "results"
 
-FIGURES_DIR = RESULTS_DIR / "figures"
+SCENARIO_DIRS = [
+    RESULTS_DIR / "without_storage",
+    RESULTS_DIR / "with_storage",
+]
 
 FIGURE_DPI = 200
 SHOW_FIGURES = True
 
 # Use absolute CNEC utilization for the heatmap.
-# The flow file contains separate positive and negative directional CNECs, and
-# utilization can therefore be negative for the negative direction.
+# The output contains separate positive and negative directional CNECs.
 USE_ABSOLUTE_CNEC_UTILIZATION = True
 
-# Optional threshold for showing CNECs in the heatmap. 0.0 shows all CNECs.
-# Example: 0.10 only shows CNECs that reach at least 10% utilization.
+# Optional threshold for showing CNECs in the heatmap.
+# 0.0 shows every CNEC.
 MINIMUM_MAX_UTILIZATION = 0.0
 
 # =============================================================================
@@ -65,24 +66,35 @@ def configure_plot_style() -> None:
     )
 
 
-def validate_input_files() -> None:
-    """Ensure that both required result files exist."""
+def validate_input_files(
+    market_meta_file: Path,
+    flows_file: Path,
+    cnecs_file: Path,
+) -> None:
+    """Ensure that all required scenario result files exist."""
+    required_files = [
+        market_meta_file,
+        flows_file,
+        cnecs_file,
+    ]
+
     missing_files = [
         path
-        for path in [MARKET_META_FILE, FLOWS_FILE]
+        for path in required_files
         if not path.exists()
     ]
 
     if missing_files:
         missing_text = "\n".join(f" - {path}" for path in missing_files)
+
         raise FileNotFoundError(
             f"Required result files were not found:\n{missing_text}"
         )
 
 
-def load_market_meta() -> pd.DataFrame:
+def load_market_meta(path: Path) -> pd.DataFrame:
     """Load market metadata and create a timestamp column."""
-    market_meta = pd.read_csv(MARKET_META_FILE)
+    market_meta = pd.read_csv(path)
 
     required_columns = {
         "zone",
@@ -96,7 +108,7 @@ def load_market_meta() -> pd.DataFrame:
 
     if missing_columns:
         raise ValueError(
-            "market_meta.csv is missing required columns: "
+            f"{path.name} is missing required columns: "
             f"{sorted(missing_columns)}"
         )
 
@@ -107,12 +119,22 @@ def load_market_meta() -> pd.DataFrame:
 
     market_meta["zone"] = market_meta["zone"].astype(str)
 
+    for column in (
+        "price",
+        "supply_volume",
+        "demand_volume",
+    ):
+        market_meta[column] = pd.to_numeric(
+            market_meta[column],
+            errors="raise",
+        )
+
     return market_meta.sort_values(["zone", "time"])
 
 
-def load_flows() -> pd.DataFrame:
-    """Load flow results and parse timestamps."""
-    flows = pd.read_csv(FLOWS_FILE)
+def load_flows(path: Path) -> pd.DataFrame:
+    """Load NTC and FBMC net-export flow results."""
+    flows = pd.read_csv(path)
 
     required_columns = {
         "time",
@@ -125,14 +147,45 @@ def load_flows() -> pd.DataFrame:
 
     if missing_columns:
         raise ValueError(
-            "flows.csv is missing required columns: "
+            f"{path.name} is missing required columns: "
             f"{sorted(missing_columns)}"
         )
 
     flows["time"] = pd.to_datetime(flows["time"], errors="raise")
     flows["line"] = flows["line"].astype(str)
+    flows["flow"] = pd.to_numeric(flows["flow"], errors="raise")
 
     return flows.sort_values(["time", "line"])
+
+
+def load_cnecs(path: Path) -> pd.DataFrame:
+    """Load CNEC diagnostics from the dedicated CNECs output file."""
+    cnecs = pd.read_csv(path)
+
+    required_columns = {
+        "time",
+        "line",
+        "network_type",
+        "utilization",
+    }
+
+    missing_columns = required_columns.difference(cnecs.columns)
+
+    if missing_columns:
+        raise ValueError(
+            f"{path.name} is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    if not cnecs.empty:
+        cnecs["time"] = pd.to_datetime(cnecs["time"], errors="raise")
+        cnecs["line"] = cnecs["line"].astype(str)
+        cnecs["utilization"] = pd.to_numeric(
+            cnecs["utilization"],
+            errors="coerce",
+        )
+
+    return cnecs.sort_values(["time", "line"])
 
 
 def zone_order(market_meta: pd.DataFrame) -> list[str]:
@@ -150,11 +203,15 @@ def format_time_axis(axis: plt.Axes) -> None:
         label.set_ha("right")
 
 
-def save_figure(figure: plt.Figure, filename: str) -> None:
-    """Save a figure and optionally display it."""
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+def save_figure(
+    figure: plt.Figure,
+    figures_dir: Path,
+    filename: str,
+) -> None:
+    """Save a figure in the scenario figure directory."""
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = FIGURES_DIR / filename
+    output_path = figures_dir / filename
 
     figure.tight_layout()
     figure.savefig(output_path, bbox_inches="tight")
@@ -169,6 +226,7 @@ def save_figure(figure: plt.Figure, filename: str) -> None:
 def create_price_plots(
     market_meta: pd.DataFrame,
     zones: list[str],
+    figures_dir: Path,
 ) -> None:
     """Create side-by-side zonal price line plots."""
     figure, axes = plt.subplots(
@@ -182,7 +240,9 @@ def create_price_plots(
     axes = axes.ravel()
 
     for axis, zone in zip(axes, zones):
-        data = market_meta.loc[market_meta["zone"] == zone]
+        data = market_meta.loc[
+            market_meta["zone"] == zone
+        ].sort_values("time")
 
         axis.plot(
             data["time"],
@@ -210,12 +270,17 @@ def create_price_plots(
         y=1.03,
     )
 
-    save_figure(figure, "zonal_prices.png")
+    save_figure(
+        figure,
+        figures_dir,
+        "zonal_prices.png",
+    )
 
 
 def create_volume_plots(
     market_meta: pd.DataFrame,
     zones: list[str],
+    figures_dir: Path,
 ) -> None:
     """Create side-by-side zonal supply and demand volume plots."""
     figure, axes = plt.subplots(
@@ -229,7 +294,9 @@ def create_volume_plots(
     axes = axes.ravel()
 
     for axis, zone in zip(axes, zones):
-        data = market_meta.loc[market_meta["zone"] == zone]
+        data = market_meta.loc[
+            market_meta["zone"] == zone
+        ].sort_values("time")
 
         axis.plot(
             data["time"],
@@ -260,15 +327,20 @@ def create_volume_plots(
         y=1.03,
     )
 
-    save_figure(figure, "zonal_supply_demand.png")
+    save_figure(
+        figure,
+        figures_dir,
+        "zonal_supply_demand.png",
+    )
 
 
 def create_net_export_plot(
     flows: pd.DataFrame,
     zones: list[str],
+    figures_dir: Path,
 ) -> None:
     """
-    Plot net export positions for all zones.
+    Plot FBMC net export positions for all zones.
 
     Positive value: net export.
     Negative value: net import.
@@ -278,15 +350,18 @@ def create_net_export_plot(
     ].copy()
 
     if net_exports.empty:
-        raise ValueError(
-            "flows.csv contains no rows with "
-            "network_type == 'FBMC_NET_EXPORT'."
+        print(
+            "Skipping zonal_net_exports.png: "
+            "flows.csv contains no FBMC_NET_EXPORT rows."
         )
+        return
 
     figure, axis = plt.subplots(figsize=(12, 5))
 
     for zone in zones:
-        data = net_exports.loc[net_exports["line"] == zone]
+        data = net_exports.loc[
+            net_exports["line"] == zone
+        ].sort_values("time")
 
         if data.empty:
             print(f"Warning: No net-export data found for {zone}.")
@@ -311,37 +386,42 @@ def create_net_export_plot(
     axis.legend(title="Zone", ncol=len(zones), loc="best")
     format_time_axis(axis)
 
-    save_figure(figure, "zonal_net_exports.png")
+    save_figure(
+        figure,
+        figures_dir,
+        "zonal_net_exports.png",
+    )
 
 
-def create_cnec_utilization_heatmap(flows: pd.DataFrame) -> None:
+def create_cnec_utilization_heatmap(
+    cnecs: pd.DataFrame,
+    figures_dir: Path,
+) -> None:
     """
     Create a CNEC utilization heatmap.
 
-    The rows are individual directional CNECs. The values represent the
-    percentage of RAM utilization. Positive and negative directions are kept
-    separate because the FBMC constraints are directional.
+    CNEC diagnostics are read from CNECs.csv. Positive and negative
+    directional CNECs are kept separate.
     """
-    cnecs = flows.loc[
-        flows["network_type"].eq("FBMC_CNEC")
+    cnecs = cnecs.loc[
+        cnecs["network_type"].eq("FBMC_CNEC")
     ].copy()
 
     if cnecs.empty:
-        raise ValueError(
-            "flows.csv contains no rows with network_type == 'FBMC_CNEC'."
+        print(
+            "Skipping cnec_utilization_heatmap.png: "
+            "CNECs.csv contains no FBMC_CNEC rows."
         )
-
-    if "utilization" not in cnecs.columns:
-        raise ValueError(
-            "flows.csv contains no 'utilization' column."
-        )
-
-    cnecs["utilization"] = pd.to_numeric(
-        cnecs["utilization"],
-        errors="coerce",
-    )
+        return
 
     cnecs = cnecs.dropna(subset=["utilization"])
+
+    if cnecs.empty:
+        print(
+            "Skipping cnec_utilization_heatmap.png: "
+            "No valid CNEC utilization values are available."
+        )
+        return
 
     if USE_ABSOLUTE_CNEC_UTILIZATION:
         cnecs["plot_utilization"] = cnecs["utilization"].abs()
@@ -356,6 +436,15 @@ def create_cnec_utilization_heatmap(flows: pd.DataFrame) -> None:
         color_min = -maximum
         color_max = maximum
         colorbar_label = "Signed RAM utilization [-]"
+
+    for column, default_value in (
+        ("cnec", ""),
+        ("cne", ""),
+        ("contingency", "basecase"),
+        ("direction", ""),
+    ):
+        if column not in cnecs.columns:
+            cnecs[column] = default_value
 
     cnecs["cnec_label"] = (
         cnecs["cnec"].fillna(cnecs["line"]).astype(str)
@@ -372,22 +461,26 @@ def create_cnec_utilization_heatmap(flows: pd.DataFrame) -> None:
         columns="time",
         values="plot_utilization",
         aggfunc="first",
-    )
-
-    heatmap_data = heatmap_data.sort_index()
+    ).sort_index()
 
     max_utilization = heatmap_data.abs().max(axis=1)
+
     heatmap_data = heatmap_data.loc[
         max_utilization.ge(MINIMUM_MAX_UTILIZATION)
     ]
 
     if heatmap_data.empty:
-        raise ValueError(
-            "No CNECs remain after applying "
-            "MINIMUM_MAX_UTILIZATION."
+        print(
+            "Skipping cnec_utilization_heatmap.png: "
+            "No CNECs remain after applying MINIMUM_MAX_UTILIZATION."
         )
+        return
 
-    figure_height = max(8, min(28, 0.24 * len(heatmap_data)))
+    figure_height = max(
+        8,
+        min(28, 0.24 * len(heatmap_data)),
+    )
+
     figure, axis = plt.subplots(
         figsize=(18, figure_height),
     )
@@ -413,39 +506,83 @@ def create_cnec_utilization_heatmap(flows: pd.DataFrame) -> None:
 
     timestamp_columns = heatmap_data.columns
 
-    tick_positions = list(range(0, len(timestamp_columns), 8))
+    tick_positions = list(
+        range(0, len(timestamp_columns), 8)
+    )
     tick_labels = [
         timestamp_columns[position].strftime("%H:%M")
         for position in tick_positions
     ]
 
-    axis.set_xticks([position + 0.5 for position in tick_positions])
+    axis.set_xticks([
+        position + 0.5
+        for position in tick_positions
+    ])
     axis.set_xticklabels(
         tick_labels,
         rotation=45,
         ha="right",
     )
 
-    save_figure(figure, "cnec_utilization_heatmap.png")
+    save_figure(
+        figure,
+        figures_dir,
+        "cnec_utilization_heatmap.png",
+    )
+
+
+def plot_scenario(scenario_dir: Path) -> None:
+    """Load one scenario folder and create all applicable figures."""
+    market_meta_file = scenario_dir / "market_meta.csv"
+    flows_file = scenario_dir / "flows.csv"
+    cnecs_file = scenario_dir / "CNECs.csv"
+    figures_dir = scenario_dir / "figures"
+
+    validate_input_files(
+        market_meta_file=market_meta_file,
+        flows_file=flows_file,
+        cnecs_file=cnecs_file,
+    )
+
+    market_meta = load_market_meta(market_meta_file)
+    flows = load_flows(flows_file)
+    cnecs = load_cnecs(cnecs_file)
+    zones = zone_order(market_meta)
+
+    print(
+        f"\nCreating plots for scenario '{scenario_dir.name}' "
+        f"and zones: {', '.join(zones)}"
+    )
+
+    create_price_plots(
+        market_meta=market_meta,
+        zones=zones,
+        figures_dir=figures_dir,
+    )
+    create_volume_plots(
+        market_meta=market_meta,
+        zones=zones,
+        figures_dir=figures_dir,
+    )
+    create_net_export_plot(
+        flows=flows,
+        zones=zones,
+        figures_dir=figures_dir,
+    )
+    create_cnec_utilization_heatmap(
+        cnecs=cnecs,
+        figures_dir=figures_dir,
+    )
+
+    print(f"Figures written to: {figures_dir}")
 
 
 def main() -> None:
-    """Load result data and create all requested plots."""
+    """Create result plots for the no-storage and storage scenarios."""
     configure_plot_style()
-    validate_input_files()
 
-    market_meta = load_market_meta()
-    flows = load_flows()
-    zones = zone_order(market_meta)
-
-    print(f"Creating plots for zones: {', '.join(zones)}")
-
-    create_price_plots(market_meta, zones)
-    create_volume_plots(market_meta, zones)
-    create_net_export_plot(flows, zones)
-    create_cnec_utilization_heatmap(flows)
-
-    print(f"All figures were written to: {FIGURES_DIR}")
+    for scenario_dir in SCENARIO_DIRS:
+        plot_scenario(scenario_dir)
 
 
 if __name__ == "__main__":

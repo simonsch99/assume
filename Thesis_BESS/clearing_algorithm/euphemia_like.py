@@ -3136,6 +3136,7 @@ def extract_results(
                 {
                     "supply_volume": supply_volume,
                     "demand_volume": -demand_volume,
+                    "matched_volume": max(supply_volume, -demand_volume),
                     "demand_volume_energy": (
                         -demand_volume * MTU_DURATION_HOURS
                     ),
