@@ -1486,6 +1486,15 @@ class ClearingTestTool:
                     / f"aggregated_curves_{zone_filename}.csv",
                 )
 
+        maxbex_frame = pd.DataFrame(
+            self.results.get("flows", {}).get("maxbex", [])
+        )
+
+        self._write_result_csv(
+            maxbex_frame,
+            output_dir / "maxbex.csv",
+        )
+
         logger.info("Results exported to %s.", output_dir)
 
     def print_summary(

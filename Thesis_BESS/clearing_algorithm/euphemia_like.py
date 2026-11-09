@@ -2453,6 +2453,184 @@ def solve_volume_flow_tiebreak(
     # NTC flows and FB net exports intentionally remain fixed. See docstring.
     return model
 
+def build_maxbex_model(
+    timestamp,
+    source_zone: str,
+    sink_zone: str,
+    market_zone_ids: list[str],
+    fbmc_params: dict | None,
+    ntc_params: dict | None,
+) -> pyo.ConcreteModel:
+    """
+    Build one MaxBex LP for one MTU and one directed zone pair.
+
+    source_zone -> sink_zone means:
+        NP[source_zone] = +q
+        NP[sink_zone]   = -q
+    """
+    fbmc_params = fbmc_params or {}
+    ntc_params = ntc_params or {}
+
+    fbmc_zone_ids = list(fbmc_params.get("fbmc_zone_ids", []))
+    cnec_list = list(fbmc_params.get("cnec_list", []))
+    ntc_line_ids = list(ntc_params.get("line_ids", []))
+
+    model = pyo.ConcreteModel()
+
+    model.zones = pyo.Set(initialize=market_zone_ids, ordered=True)
+    model.fbmc_zones = pyo.Set(initialize=fbmc_zone_ids, ordered=True)
+    model.cnecs = pyo.Set(initialize=cnec_list, ordered=True)
+    model.ntc_lines = pyo.Set(initialize=ntc_line_ids, ordered=True)
+
+    # Net position convention in the existing code:
+    # positive = net export; negative = net import.
+    model.net_position = pyo.Var(model.zones, domain=pyo.Reals)
+
+    # MaxBex value in MW.
+    model.maxbex = pyo.Var(domain=pyo.NonNegativeReals)
+
+    if fbmc_zone_ids:
+        model.net_export_fb = pyo.Var(
+            model.fbmc_zones,
+            domain=pyo.Reals,
+        )
+
+    if ntc_line_ids:
+        model.ntc_flow = pyo.Var(
+            model.ntc_lines,
+            domain=pyo.Reals,
+        )
+
+    model.constraints = pyo.ConstraintList()
+
+    # -----------------------------------------------------------------
+    # Pair-specific net-position restrictions from the JAO definition.
+    # -----------------------------------------------------------------
+    for zone in market_zone_ids:
+        if zone == source_zone:
+            model.constraints.add(
+                model.net_position[zone] == model.maxbex
+            )
+        elif zone == sink_zone:
+            model.constraints.add(
+                model.net_position[zone] == -model.maxbex
+            )
+        else:
+            model.constraints.add(
+                model.net_position[zone] == 0.0
+            )
+
+    # -----------------------------------------------------------------
+    # NTC capacity constraints.
+    # -----------------------------------------------------------------
+    for line_id in ntc_line_ids:
+        model.constraints.add(
+            model.ntc_flow[line_id]
+            <= ntc_params["capacity_up"][(timestamp, line_id)]
+        )
+        model.constraints.add(
+            model.ntc_flow[line_id]
+            >= -ntc_params["capacity_down"][(timestamp, line_id)]
+        )
+
+    # -----------------------------------------------------------------
+    # FB domain: PTDF × FB net exports <= RAM.
+    # -----------------------------------------------------------------
+    if fbmc_zone_ids:
+        model.constraints.add(
+            sum(model.net_export_fb[zone] for zone in model.fbmc_zones)
+            == 0.0
+        )
+
+        for cnec in cnec_list:
+            model.constraints.add(
+                sum(
+                    fbmc_params["ptdf_zonal"][
+                        (timestamp, cnec, zone)
+                    ]
+                    * model.net_export_fb[zone]
+                    for zone in model.fbmc_zones
+                )
+                <= fbmc_params["ram"][(timestamp, cnec)]
+            )
+
+    # -----------------------------------------------------------------
+    # Same zonal-balance logic as in market_clearing_opt_constraints().
+    # -----------------------------------------------------------------
+    for zone in market_zone_ids:
+        ntc_export = sum(
+            model.ntc_flow[line_id]
+            for line_id in ntc_line_ids
+            if ntc_params["from_zone"][line_id] == zone
+        ) - sum(
+            model.ntc_flow[line_id]
+            for line_id in ntc_line_ids
+            if ntc_params["to_zone"][line_id] == zone
+        )
+
+        fb_export = (
+            model.net_export_fb[zone]
+            if zone in fbmc_zone_ids
+            else 0.0
+        )
+
+        model.constraints.add(
+            model.net_position[zone] == fb_export + ntc_export
+        )
+
+    model.objective = pyo.Objective(
+        expr=model.maxbex,
+        sense=pyo.maximize,
+    )
+
+    return model
+
+def calculate_maxbex(
+    snapshots,
+    market_zone_ids: list[str],
+    fbmc_params: dict | None,
+    ntc_params: dict | None,
+    solver: OptSolver,
+    solver_options: dict,
+) -> list[dict]:
+    """Calculate directed MaxBex values in MW for all MTUs and zone pairs."""
+    results = []
+
+    for timestamp in snapshots:
+        for source_zone in market_zone_ids:
+            for sink_zone in market_zone_ids:
+                if source_zone == sink_zone:
+                    continue
+
+                model = build_maxbex_model(
+                    timestamp=timestamp,
+                    source_zone=source_zone,
+                    sink_zone=sink_zone,
+                    market_zone_ids=market_zone_ids,
+                    fbmc_params=fbmc_params,
+                    ntc_params=ntc_params,
+                )
+
+                _solve_checked(
+                    solver=solver,
+                    model=model,
+                    solver_options=solver_options,
+                    context=(
+                        f"MaxBex {source_zone}->{sink_zone} "
+                        f"at {timestamp}"
+                    ),
+                )
+
+                results.append(
+                    {
+                        "product_start": timestamp,
+                        "from_zone": source_zone,
+                        "to_zone": sink_zone,
+                        "maxbex_mw": float(pyo.value(model.maxbex)),
+                    }
+                )
+
+    return results
 
 class ComplexClearingRole(MarketRole):
     """EUPHEMIA-like market clearing with NTC, FBMC, or hybrid coupling."""
@@ -2792,6 +2970,26 @@ class ComplexClearingRole(MarketRole):
                     market_zone_ids.append(zone)
 
         self.market_zone_ids = market_zone_ids
+
+        calculate_maxbex_enabled = self.marketconfig.param_dict.get(
+            "calculate_maxbex",
+            False,
+        )
+
+        maxbex_results = []
+
+        if calculate_maxbex_enabled:
+            logger.info("Calculating MaxBex for all MTUs and directed zone pairs.")
+
+            maxbex_results = calculate_maxbex(
+                snapshots=snapshots,
+                market_zone_ids=market_zone_ids,
+                fbmc_params=fbmc_params,
+                ntc_params=ntc_params,
+                solver=self.solver,
+                solver_options=self.solver_options,
+            )
+            
         child_orders = []
 
         for order in orderbook:
@@ -2933,6 +3131,9 @@ class ComplexClearingRole(MarketRole):
 
         self.line_results = line_results
         self.all_orders = []
+
+        # attach maxbex results to existing result dictionary for later extraction
+        flows["maxbex"] = maxbex_results
 
         return accepted_orders, rejected_orders, meta, flows
 

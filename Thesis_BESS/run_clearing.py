@@ -49,18 +49,18 @@ ALIGN_SNAPSHOTS = True # reassign network timestamps to DELIVERY_DATE
 
 
 # Storage Order Config
-STORAGE_ORDER_COUNT = 5       # 0 disables storage additions
+STORAGE_ORDER_COUNT = 4       # 0 disables storage additions
 STORAGE_ZONE = "Z1"           # must exist in the normalized network zones
 
 # Energy: MWh; power: MW; costs and terminal value: EUR/MWh.
 # Each operating limit accepts either a scalar or a complete mapping
 # {market_product_start_timestamp: value}.
 STORAGE_CONFIG = {
-    "max_energy": 2000.0,
+    "max_energy": 500.0,
     "min_energy": 0.0,
-    "max_input_power": 250.0,
-    "max_output_power": 250.0,
-    "starting_energy": 0.0,
+    "max_input_power": 125.0,
+    "max_output_power": 125.0,
+    "starting_energy": 0.5,
     "efficiency": 0.86,
     "cycling_cost": 10.0,
     "end_of_day_value": 0.0,
@@ -514,6 +514,7 @@ def run_pipeline(
         param_dict={
             "solver_name": solver_name,
             "log_flows": True,
+            "calculate_maxbex": True,
         },
     )
 
