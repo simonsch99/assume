@@ -45,6 +45,7 @@ from clearing_algorithm.euphemia_like import (
 )
 
 from tools.order_layout import native_profile_columns, read_block_layout
+from tools.units import mw_to_mwh
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,10 @@ class QuarterHourlyOrderReader:
 
     ``bidding_zone`` is optional per row, but must be the trailing layout
     column. An empty zone is resolved by ClearingTestTool.default_node.
+
+    The reader expects internal order-book quantities in MW. Raw EPEX files,
+    whose volumes are MWh per 15-minute MTU, must first pass through
+    preprocess_orders.py.
     """
 
     REQUIRED_COLUMNS = {
@@ -146,7 +151,13 @@ class QuarterHourlyOrderReader:
         return orders
 
 class BlockOrderReader:
-    """Read native-layout EPEX-like block bids."""
+    """
+    Read native-layout EPEX-like block bids.
+    
+    The reader expects internal order-book quantities in MW. Raw EPEX files,
+    whose volumes are MWh per 15-minute MTU, must first pass through
+    preprocess_orders.py.
+    """
 
     def read(self, path: str | Path) -> list[dict]:
         layout = read_block_layout(path)
@@ -183,10 +194,9 @@ class BlockOrderReader:
                             str(row["BlockCodePRM"]).strip() or None
                         ),
                         "price": float(row["Limit Price"]),
-                        # Native convention:
-                        # positive raw profile = sell;
-                        # negative raw profile = purchase.
-                        # ASSUME convention is the reverse sign.
+                        # EPEX: negative = sell; positive = purchase.
+                        # ASSUME: positive = supply; negative = demand.
+                        # Input profiles have already been converted to MW.
                         "intervals": [
                             -float(row[column])
                             for column in profile_columns
@@ -1077,7 +1087,7 @@ class ClearingTestTool:
                     "agent_id": order.get("agent_addr", ("", ""))[0],
                     "bid_type": order.get("bid_type"),
                     "price": order.get("price"),
-                    "volume": self._serialize(order.get("volume")),
+                    "volume": self._serialize(mw_to_mwh(order.get("volume"))),
                     "node": order.get("node"),
                     "start_time": order.get("start_time"),
                     "end_time": order.get("end_time"),
@@ -1088,13 +1098,13 @@ class ClearingTestTool:
                     "efficiency": order.get("efficiency"),
                     "cycling_cost": order.get("cycling_cost"),
                     "end_of_day_value": order.get("end_of_day_value"),
-                    "accepted_volume": self._serialize(accepted_volume),
-                    "accepted_net_volume": self._serialize(accepted_volume),
+                    "accepted_volume": self._serialize(mw_to_mwh(accepted_volume)),
+                    "accepted_net_volume": self._serialize(mw_to_mwh(accepted_volume)),
                     "accepted_price": self._serialize(
                         order.get("accepted_price", 0.0)
                     ),
-                    "charge": self._serialize(order.get("charge")),
-                    "discharge": self._serialize(order.get("discharge")),
+                    "charge": self._serialize(mw_to_mwh(order.get("charge"))),
+                    "discharge": self._serialize(mw_to_mwh(order.get("discharge"))),
                     "soc": self._serialize(order.get("soc")),
                     "storage_surplus_eur": self._serialize(
                         order.get("storage_surplus_eur")
@@ -1102,6 +1112,7 @@ class ClearingTestTool:
                     "total_storage_surplus_eur": order.get(
                         "total_storage_surplus_eur"
                     ),
+                    "volume_unit": "MWh",
                 }
             )
 
@@ -1214,7 +1225,7 @@ class ClearingTestTool:
             for timestamp in timestamps
         }
 
-        def add_bid(timestamp, side, price, volume):
+        def add_bid(timestamp, side, price, volume, keep_zero=False):
             timestamp = pd.Timestamp(timestamp)
             volume = float(volume)
 
@@ -1224,9 +1235,8 @@ class ClearingTestTool:
                     "the clearing horizon."
                 )
 
-            if volume > 0.0:
+            if volume > 0.0 or keep_zero:
                 bids[timestamp][side].append((float(price), volume))
-
         # Use the cleared order objects so zone normalization and any
         # validation/clipping are reflected in the exported curves.
         orders = [
@@ -1299,23 +1309,27 @@ class ClearingTestTool:
                 "Sell",
                 price_floor,
                 max(0.0, -net_position),
+                keep_zero=True,
             )
             add_bid(
                 timestamp,
                 "Purchase",
                 price_cap,
                 max(0.0, net_position),
+                keep_zero=True,
             )
 
             # These remain separate synthetic bids at the same endpoint.
             add_bid(
-                timestamp, "Sell", price_floor, block_sell[timestamp]
+                timestamp, "Sell", price_floor, block_sell[timestamp],
+                keep_zero=True,
             )
             add_bid(
                 timestamp,
                 "Purchase",
                 price_cap,
                 block_purchase[timestamp],
+                keep_zero=True,
             )
             add_bid(
                 timestamp, "Sell", price_floor, storage_sell[timestamp]
@@ -1338,15 +1352,13 @@ class ClearingTestTool:
                     "Hour": timestamp.hour + 1,
                     "Quarter hour": timestamp.minute // 15 + 1,
                     "Price": price,
-                    "Volume": max(0.0, volume),
+                    "Volume": max(0.0, volume) * MTU_DURATION_HOURS,
                     "Sale/Purchase": side,
                 }
             )
 
         for timestamp in timestamps:
             for side in ("Sell", "Purchase"):
-                # Sort using full-precision bid prices. Rounding happens
-                # only when writing the CSV.
                 side_bids = sorted(
                     bids[timestamp][side],
                     key=lambda bid: bid[0],
@@ -1358,13 +1370,7 @@ class ClearingTestTool:
                     else sum(volume for _, volume in side_bids)
                 )
 
-                append_point(
-                    timestamp, side, price_floor, cumulative
-                )
-
                 for price, volume in side_bids:
-                    # Before/after points at the same price represent
-                    # a discrete bid's vertical volume step.
                     append_point(timestamp, side, price, cumulative)
 
                     cumulative += (
@@ -1372,10 +1378,6 @@ class ClearingTestTool:
                     )
 
                     append_point(timestamp, side, price, cumulative)
-
-                append_point(
-                    timestamp, side, price_cap, cumulative
-                )
 
         return pd.DataFrame(rows, columns=columns)
 
@@ -1418,6 +1420,24 @@ class ClearingTestTool:
             meta["matched_volume"] = meta[
                 ["supply_volume", "demand_volume"]
             ].max(axis=1)
+
+            # Internal market metadata is MW. Final CSV output is MWh per MTU.
+            for column in (
+                "supply_volume",
+                "demand_volume",
+                "matched_volume",
+            ):
+                meta[f"{column}_mwh"] = (
+                    meta[column] * MTU_DURATION_HOURS
+                )
+
+            meta = meta.drop(
+                columns=[
+                    "supply_volume_energy",
+                    "demand_volume_energy",
+                ],
+                errors="ignore",
+            )
 
         self._write_result_csv(
             meta,
