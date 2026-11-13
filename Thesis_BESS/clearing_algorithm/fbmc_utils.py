@@ -39,6 +39,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Hashable
 
+import xarray as xr
 import numpy as np
 import pandas as pd
 import pypsa
@@ -408,6 +409,88 @@ def _aggregate_zonal_net_positions(
     return result
 
 
+def _make_n1_extra_functionality(
+    cnec_info: pd.DataFrame,
+    frm: float,
+    slack_penalty: float | None,
+):
+    """
+    Return a PyPSA ``extra_functionality`` hook enforcing, for every
+    N-1 CNEC (cne, outage):
+
+        |F_cne + LODF[cne, outage] * F_outage| <= capacity[cne] * (1 - frm)
+
+    This is the same condition that the reference-point check in
+    ``precompute_fbmc_parameters`` tests. The positive and negative CNEC
+    rows share one LODF, so each (cne, outage) pair is used once.
+
+    If ``slack_penalty`` (EUR/MW) is given, violations are allowed at that
+    cost, which avoids infeasibility. Otherwise the constraints are hard.
+    """
+    pairs = (
+        cnec_info.loc[cnec_info["contingency"] != BASECASE_CONTINGENCY]
+        .drop_duplicates(["cne", "contingency"])
+        .reset_index(drop=True)
+    )
+
+    def extra_functionality(n: pypsa.Network, snapshots) -> None:
+        if pairs.empty:
+            return
+
+        m = n.model
+        flow = m["Line-s"]  # line flow p0 in MW
+
+        # Name of the line dimension, e.g. "name" (newer PyPSA) or "Line".
+        line_dim = next(d for d in flow.dims if d != "snapshot")
+        line_names = list(n.lines.index)
+        pos = {name: i for i, name in enumerate(line_names)}
+
+        # Coefficient matrix: one row per N-1 pair, one column per line.
+        coeff = np.zeros((len(pairs), len(line_names)))
+        for k, r in enumerate(pairs.itertuples()):
+            coeff[k, pos[r.cne]] += 1.0
+            coeff[k, pos[r.contingency]] += float(r.lodf)
+
+        coeff_da = xr.DataArray(
+            coeff,
+            coords={
+                "n1": np.arange(len(pairs)),
+                line_dim: line_names,
+            },
+            dims=["n1", line_dim],
+        )
+
+        limit = xr.DataArray(
+            (pairs["capacity"] * (1.0 - frm)).to_numpy(dtype=float),
+            coords={"n1": np.arange(len(pairs))},
+            dims="n1",
+        )
+
+        # Linear expression: sum over lines of coeff * flow -> dims (snapshot, n1)
+        post_contingency_flow = (flow * coeff_da).sum(line_dim)
+
+        if slack_penalty is None:
+            m.add_constraints(post_contingency_flow <= limit, name="n1_upper")
+            m.add_constraints(post_contingency_flow >= -limit, name="n1_lower")
+            return
+
+        slack = m.add_variables(
+            lower=0.0,
+            coords=[pd.Index(snapshots, name="snapshot"),
+                    pd.RangeIndex(len(pairs), name="n1")],
+            name="n1_slack",
+        )
+        m.add_constraints(
+            post_contingency_flow - slack <= limit, name="n1_upper"
+        )
+        m.add_constraints(
+            post_contingency_flow + slack >= -limit, name="n1_lower"
+        )
+        m.objective = m.objective + slack_penalty * slack.sum()
+
+    return extra_functionality
+
+
 def solve_d2_base_case(
     network: pypsa.Network,
     snapshots: pd.Index,
@@ -415,6 +498,8 @@ def solve_d2_base_case(
     frm: float = 0.0,
     cnes: pd.Index | None = None,
     solver_name: str | None = None,
+    cnec_info: pd.DataFrame | None = None,
+    n1_slack_penalty: float | None = None,
 ) -> dict:
     """
     Solve a nodal D-2 economic dispatch.
@@ -472,11 +557,18 @@ def solve_d2_base_case(
 
     selected_solver = get_supported_solver_linopy(solver_name)
 
+    extra_functionality = (
+        _make_n1_extra_functionality(cnec_info, frm, n1_slack_penalty)
+        if cnec_info is not None
+        else None
+    )
+
     status, termination_condition = n.optimize(
         solver_name=selected_solver,
         log_to_console=False,
         progress=False,
         include_objective_constant=True,
+        extra_functionality=extra_functionality,
     )
 
     if status != "ok":
@@ -516,6 +608,16 @@ def solve_d2_base_case(
             "D-2 energy-balance error is %.6f MW.",
             balance_error,
         )
+
+    if cnec_info is not None and n1_slack_penalty is not None:
+        slack_values = n.model.variables["n1_slack"].solution
+        max_slack = float(slack_values.max())
+        if max_slack > 1e-6:
+            logger.warning(
+                "D-2 N-1 security could not be fully met; maximum slack "
+                "is %.3f MW.",
+                max_slack,
+            )
 
     return {
         "network": n,
@@ -1307,6 +1409,7 @@ def precompute_fbmc_parameters(
     zone_column: str = "zone_id",
     snapshots: pd.Index | None = None,
     solver_name: str | None = None,
+    n1_slack_penalty: float | None = None,
 ) -> dict:
     """
     Run the complete FBMC parameter pre-computation workflow.
@@ -1472,6 +1575,8 @@ def precompute_fbmc_parameters(
         frm=frm,
         cnes=cnes,
         solver_name=solver_name,
+        cnec_info=cnec_info,
+        n1_slack_penalty=n1_slack_penalty,
     )
 
     # 7. Market GSKs and CNEC PTDFs. Only FB-zone columns are retained.
