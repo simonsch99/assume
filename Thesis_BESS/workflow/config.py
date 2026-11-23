@@ -42,10 +42,7 @@ SIMULATOR_INPUT_ROOT = OUTPUT_ROOT / "simulator_input"
 SIMULATOR_OUTPUT_ROOT = OUTPUT_ROOT / "price_simulator"
 
 # Runner script of the price simulator (same Python environment as the benchmark).
-SIMULATOR_RUNNER = Path(
-    r"S:\23502\5\500_ESA\ESW_51520\Aktuell\80_Masterarbeiten\Schiebel_Simon"
-    r"\04_code\price_simulated\tools\run_simulator_scenarios.py"
-)
+SIMULATOR_RUNNER = Path("Path to price simulator")
 
 # File-name conventions expected by the simulator. Must match
 # price_simulation.config (CSV_CURVES_GLOB_15MIN, COUPLING_CSV_FILE_GLOB).
