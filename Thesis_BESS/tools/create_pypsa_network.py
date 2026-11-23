@@ -6,7 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-folder = Path("S:/23502/5/500_ESA/ESW_51520/Aktuell/80_Masterarbeiten/Schiebel_Simon/03_data/test_network")
+folder = Path("/data/test_network")
 
 # Read the filtered CSV files
 bus = pd.read_csv(folder / "df_bus_filtered.csv")
