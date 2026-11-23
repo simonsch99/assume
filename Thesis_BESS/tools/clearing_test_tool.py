@@ -1309,27 +1309,27 @@ class ClearingTestTool:
                 "Sell",
                 price_floor,
                 max(0.0, -net_position),
-                keep_zero=True,
+                keep_zero=False,
             )
             add_bid(
                 timestamp,
                 "Purchase",
                 price_cap,
                 max(0.0, net_position),
-                keep_zero=True,
+                keep_zero=False,
             )
 
             # These remain separate synthetic bids at the same endpoint.
             add_bid(
                 timestamp, "Sell", price_floor, block_sell[timestamp],
-                keep_zero=True,
+                keep_zero=False,
             )
             add_bid(
                 timestamp,
                 "Purchase",
                 price_cap,
                 block_purchase[timestamp],
-                keep_zero=True,
+                keep_zero=False,
             )
             add_bid(
                 timestamp, "Sell", price_floor, storage_sell[timestamp]
