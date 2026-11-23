@@ -75,10 +75,51 @@ def _log_stage_duration(
         elapsed_seconds,
     )
 
-EPS = 1e-5  # TODO Decide on a good value
+EPS = 1e-6  # TODO Decide on a good value
 
 MTU_DURATION = timedelta(minutes=15)
 MTU_DURATION_HOURS = 0.25
+
+# Pricing classification only; not a solver feasibility tolerance.
+# 1e-7 MW = 0.1 W.
+SIMPLE_BID_VOLUME_TOL_MW = 1e-7
+
+
+def classify_simple_bid_acceptance(
+    volume: float,
+    acceptance: float,
+    tolerance_mw: float = SIMPLE_BID_VOLUME_TOL_MW,
+) -> str:
+    """Classify a simple bid as zero-volume, rejected, full, or partial.
+
+    The tolerance is capped below half the order volume so that rejected and
+    full classifications cannot overlap, even for very small orders.
+    This function does not modify the acceptance or the physical dispatch.
+    """
+    volume = float(volume)
+    acceptance = float(acceptance)
+    tolerance_mw = float(tolerance_mw)
+
+    if not isfinite(volume) or not isfinite(acceptance):
+        raise ValueError("Simple bid volume and acceptance must be finite")
+    if not isfinite(tolerance_mw) or tolerance_mw < 0:
+        raise ValueError("Simple bid volume tolerance must be non-negative")
+    if not 0.0 <= acceptance <= 1.0:
+        raise ValueError("Simple bid acceptance must be in [0, 1]")
+
+    magnitude = abs(volume)
+    if magnitude == 0.0:
+        return "zero-volume"
+
+    tolerance = min(tolerance_mw, 0.49 * magnitude)
+    accepted_mw = magnitude * acceptance
+    unaccepted_mw = magnitude * (1.0 - acceptance)
+
+    if accepted_mw <= tolerance:
+        return "rejected"
+    if unaccepted_mw <= tolerance:
+        return "full"
+    return "partial"
 
 def _storage_orders(orders: Orderbook) -> dict[str, dict]:
     """Return Storage Orders indexed by bid ID."""
@@ -1257,9 +1298,10 @@ def build_price_feasibility_model(
 
         if volume == 0:
             continue
-
-        rejected = acceptance <= EPS
-        full = acceptance >= 1.0 - EPS
+        
+        status = classify_simple_bid_acceptance(volume, acceptance)
+        rejected = status == "rejected"
+        full = status == "full"
 
         if volume > 0:
             if rejected:
@@ -1990,7 +2032,9 @@ def _get_directly_fixed_prices(
         bid_id = order["bid_id"]
         acceptance = master_solution["simple_acceptance"][bid_id]
 
-        if not EPS < acceptance < 1.0 - EPS:
+        if classify_simple_bid_acceptance(
+            order["volume"], acceptance
+        ) != "partial":
             continue
 
         key = (
@@ -2647,7 +2691,8 @@ class ComplexClearingRole(MarketRole):
         if self.solver_name == "gurobi":
             self.solver_options = {
                 #"cutoff": -1.0,
-                "MIPGap": EPS,
+                "MIPGap": 1e-9,
+                "MIPGapAbs": 1e-9,
                 "Threads": 8,
             }
 
@@ -2945,6 +2990,7 @@ class ComplexClearingRole(MarketRole):
                 solver_name=self.marketconfig.param_dict.get(
                     "fbmc_solver_name"
                 ),
+                **self.marketconfig.param_dict.get("fbmc_kwargs", {}),
             )
 
             _log_stage_duration(
@@ -3173,8 +3219,7 @@ def extract_results(
 
     for order in orders:
         if order["bid_type"] == "SB":
-            acceptance = pyo.value(model.xs[order["bid_id"]])
-            acceptance = 0.0 if acceptance < EPS else acceptance
+            acceptance = float(pyo.value(model.xs[order["bid_id"]]))
 
             order["accepted_volume"] = acceptance * order["volume"]
 
